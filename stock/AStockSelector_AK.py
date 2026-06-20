@@ -273,6 +273,9 @@ def standardize_spot_df(df, source, include_bj=False):
         "pe": pick("市盈率-动态", "市盈率", "per"),
         "market_cap": pick("总市值", "总市值(元)", "mktcap"),
         "circ_market_cap": pick("流通市值", "流通市值(元)", "nmc"),
+        "today_high": pick("最高", "今日最高"),
+        "today_low": pick("最低", "今日最低"),
+        "pb": pick("市净率"),
     }
 
     required = ["code", "name", "price"]
@@ -288,7 +291,8 @@ def standardize_spot_df(df, source, include_bj=False):
     out["code"] = out["code"].map(normalize_code)
     out["name"] = out["name"].astype(str).str.strip()
 
-    for col in ["price", "pct_chg", "volume", "volume_ratio", "turnover", "pe", "market_cap", "circ_market_cap"]:
+    for col in ["price", "pct_chg", "volume", "volume_ratio", "turnover", "pe",
+                 "market_cap", "circ_market_cap", "today_high", "today_low", "pb"]:
         if col in out.columns:
             out[col] = out[col].map(safe_float)
 
@@ -302,80 +306,6 @@ def standardize_spot_df(df, source, include_bj=False):
     out = out[(out["price"].notna()) & (out["price"] > 0)]
     out = out.reset_index(drop=True)
     out.attrs["spot_source"] = source
-    return out
-
-
-def fetch_report_data(report_date="", max_try_dates=8, include_bj=False):
-    """使用 akshare 财报接口拉取最新报告。"""
-    dates = [report_date] if report_date else recent_report_dates(max_try_dates)
-    last_err = None
-
-    for d in dates:
-        try:
-            print(f"尝试财报日期: {d}")
-            df = ak.stock_yjbb_em(date=d)
-            if df is None or df.empty:
-                continue
-            out = standardize_report_df(df, report_date=d, include_bj=include_bj)
-            if not out.empty:
-                return out, d
-        except Exception as e:
-            last_err = e
-            continue
-
-    if report_date:
-        raise RuntimeError(f"无法获取指定财报日期 {report_date} 的数据: {repr(last_err)}") from last_err
-    raise RuntimeError(f"无法获取可用财报数据，最近错误: {repr(last_err)}") from last_err
-
-
-def standardize_report_df(df, report_date, include_bj=False):
-    cols = {str(x).strip(): x for x in df.columns}
-
-    def pick(*names):
-        for n in names:
-            if n in cols:
-                return cols[n]
-        return None
-
-    mapping = {
-        "code": pick("股票代码", "代码"),
-        "name": pick("股票简称", "名称"),
-        "eps": pick("每股收益"),
-        "revenue": pick("营业总收入-营业总收入", "营业收入-营业收入"),
-        "revenue_yoy": pick("营业总收入-同比增长", "营业收入-同比增长"),
-        "net_profit": pick("净利润-净利润"),
-        "profit_yoy": pick("净利润-同比增长"),
-        "industry": pick("所处行业", "行业"),
-        "notice_date": pick("最新公告日期", "公告日期"),
-    }
-
-    if mapping["code"] is None:
-        raise RuntimeError(f"财报字段缺失 code；实际字段: {list(df.columns)}")
-
-    use_cols = [v for v in mapping.values() if v is not None]
-    out = df[use_cols].copy()
-    rename_map = {v: k for k, v in mapping.items() if v is not None}
-    out.rename(columns=rename_map, inplace=True)
-
-    out["code"] = out["code"].map(normalize_code)
-    if "name" in out.columns:
-        out["name"] = out["name"].astype(str).str.strip()
-
-    for col in ["eps", "revenue", "revenue_yoy", "net_profit", "profit_yoy"]:
-        if col in out.columns:
-            out[col] = out[col].map(safe_float)
-
-    if "revenue" in out.columns:
-        out["revenue"] = out["revenue"].map(lambda x: x / 1e8 if x is not None else None)
-    if "net_profit" in out.columns:
-        out["net_profit"] = out["net_profit"].map(lambda x: x / 1e8 if x is not None else None)
-
-    if "notice_date" not in out.columns:
-        out["notice_date"] = None
-
-    out["report_date"] = report_date
-    out = out[out["code"].map(lambda x: is_a_share_code(x, include_bj=include_bj))]
-    out = out.drop_duplicates(subset=["code"], keep="first").reset_index(drop=True)
     return out
 
 
@@ -452,13 +382,34 @@ def enrich_with_recent_lows(rows, days=5, max_workers=5, data_source="auto"):
 
 
 def pass_low_rising_filter(item):
-    """检验近3天最低价是否单调递增 (low_3 < low_4 < low_5)，数据不足返回 False。"""
+    """检验近3天最低价是否单调递增 (low_3 < low_4 < low_5)。
+    若数据完全未获取（low_1~5 均为 None，说明 K 线 API 不可用），返回 True（跳过过滤）。"""
+    # 判断是否完全没有获取到数据
+    any_low = any(item.get(f"low_{i}") is not None for i in range(1, 6))
+    if not any_low:
+        return True   # K 线 API 不可用，跳过该过滤
     v3 = safe_float(item.get("low_3"))
     v4 = safe_float(item.get("low_4"))
     v5 = safe_float(item.get("low_5"))
     if v3 is None or v4 is None or v5 is None:
-        return False
+        return False  # 数据部分缺失（不足5天），视为不满足
     return v3 < v4 < v5
+
+
+def enrich_with_indicators(rows, fetch_tail=True, fetch_roe=False,
+                           max_workers=5, progress_cb=None):
+    """为筛选结果批量补充技术指标（MA、尾盘、高低点、ROE等）。
+    需要 indicators.py 模块，每只股票约需 0.5-1s 的 API 请求时间。"""
+    try:
+        import indicators as ind
+        ind.clear_cache()
+        rows = ind.enrich_indicators(
+            rows, fetch_tail=fetch_tail, fetch_roe=fetch_roe,
+            max_workers=max_workers, progress_cb=progress_cb
+        )
+    except ImportError:
+        pass   # indicators.py 不存在时静默跳过
+    return rows
 
 
 def pass_filters(item, args):
@@ -467,6 +418,15 @@ def pass_filters(item, args):
 
     def le(v, threshold):
         return True if threshold is None else (v is not None and v <= threshold)
+
+    def flag_check(v, required):
+        """required=True 时要求 v==1（price above MA）。
+        若 v 为 None（指标未获取），则跳过该过滤条件（不淘汰股票）。"""
+        if not required:
+            return True
+        if v is None:   # 指标未获取 → 不过滤
+            return True
+        return v == 1
 
     checks = [
         ge(item.get("price"), args.min_price),
@@ -482,10 +442,18 @@ def pass_filters(item, args):
         le(item.get("market_cap"), args.max_market_cap),
         ge(item.get("pe"), args.min_pe),
         le(item.get("pe"), args.max_pe),
-        ge(item.get("eps"), args.min_eps),
-        ge(item.get("net_profit"), args.min_net_profit),
-        ge(item.get("revenue_yoy"), args.min_revenue_yoy),
-        ge(item.get("profit_yoy"), args.min_profit_yoy),
+        le(item.get("pb"), getattr(args, "max_pb", None)),
+        ge(item.get("roe"), getattr(args, "min_roe", None)),
+        # 均线过滤（仅在已丰富指标后生效）
+        flag_check(item.get("above_ma5"),  getattr(args, "price_above_ma5",  False)),
+        flag_check(item.get("above_ma10"), getattr(args, "price_above_ma10", False)),
+        flag_check(item.get("above_ma20"), getattr(args, "price_above_ma20", False)),
+        # MA5 趋势（未获取时跳过）
+        (True if not getattr(args, "ma5_trend_up", False)
+         else (item.get("ma5_trend") is None or item.get("ma5_trend") == "up")),
+        # 尾盘过滤（未获取时跳过）
+        (True if not getattr(args, "tail_30min_positive", False)
+         else (item.get("tail_30min_pct") is None or item["tail_30min_pct"] > 0)),
     ]
     return all(checks)
 
@@ -521,11 +489,7 @@ def print_table(rows):
         ("换手%", 8),
         ("总市值亿", 11),
         ("PE", 8),
-        ("EPS", 8),
-        ("净利润亿", 10),
-        ("利润同比%", 10),
-        ("公告日", 12),
-        ("报告期", 10),
+        ("PB", 8),
     ]
     line = " ".join(str(title).ljust(width) for title, width in headers)
     print(line)
@@ -542,13 +506,10 @@ def print_table(rows):
             format_num(x.get("turnover"), 2).rjust(8),
             format_num(x.get("market_cap"), 2).rjust(11),
             format_num(x.get("pe"), 2).rjust(8),
-            format_num(x.get("eps"), 2).rjust(8),
-            format_num(x.get("net_profit"), 2).rjust(10),
-            format_num(x.get("profit_yoy"), 2).rjust(10),
-            str(x.get("notice_date") or "-")[:10].ljust(12),
-            str(x.get("report_date") or "-")[:10].ljust(10),
+            format_num(x.get("pb"), 2).rjust(8),
         ]
-        print(" ".join(vals))
+        manual_mark = " [手动]" if x.get("_manual") else ""
+        print(" ".join(vals) + manual_mark)
 
 
 def export_csv(rows, path):
@@ -556,9 +517,11 @@ def export_csv(rows, path):
     if df.empty:
         df = pd.DataFrame(columns=[
             "code", "name", "price", "pct_chg", "volume", "volume_ratio", "turnover",
-            "market_cap", "circ_market_cap", "pe", "eps", "revenue", "net_profit",
-            "revenue_yoy", "profit_yoy", "industry", "notice_date", "report_date"
+            "market_cap", "circ_market_cap", "pe", "pb",
         ])
+    # 不导出内部标记列
+    if "_manual" in df.columns:
+        df = df.drop(columns=["_manual"])
     df.to_csv(path, index=False, encoding="utf-8-sig")
 
 
@@ -566,14 +529,17 @@ def build_parser():
     p = argparse.ArgumentParser(description="基于 akshare 的 A 股筛选脚本")
     p.add_argument("--top-n", type=int, default=20, help="输出前 N 只股票")
     p.add_argument("--sort-by", type=str, default="pct_chg",
-                   choices=["price", "pct_chg", "volume", "volume_ratio", "turnover", "market_cap", "circ_market_cap", "pe", "eps", "revenue", "net_profit", "revenue_yoy", "profit_yoy"],
+                   choices=["price", "pct_chg", "volume", "volume_ratio", "turnover",
+                            "market_cap", "circ_market_cap", "pe", "pb", "roe",
+                            "ma5", "ma10", "ma20", "tail_30min_pct"],
                    help="排序字段")
     p.add_argument("--ascending", action="store_true", help="升序排序，默认降序")
     p.add_argument("--csv", type=str, default="", help="自定义导出 CSV 文件名")
-    p.add_argument("--report-date", type=str, default="", help="指定财报日期，如 20241231；不传则自动尝试最近可用报告期")
-    p.add_argument("--finance-only", action="store_true", help="仅测试/输出财报数据，不拉取实时行情")
+    p.add_argument("--add-codes", type=str, default="",
+                   help="主动添加的股票代码（逗号分隔，如 000001,600519），跳过筛选和 TOP-N 限制直接附加")
     p.add_argument("--include-bj", action="store_true", help="包含北交所股票")
 
+    # 行情条件
     p.add_argument("--min-price", type=float)
     p.add_argument("--max-price", type=float)
     p.add_argument("--min-pct-chg", type=float)
@@ -587,45 +553,29 @@ def build_parser():
     p.add_argument("--max-market-cap", type=float, help="单位：亿元")
     p.add_argument("--min-pe", type=float)
     p.add_argument("--max-pe", type=float)
+    p.add_argument("--max-pb", type=float, help="最大市净率")
+    p.add_argument("--min-roe", type=float, help="最小 ROE%%（需开启 --fetch-indicators）")
 
-    p.add_argument("--min-eps", type=float)
-    p.add_argument("--min-net-profit", type=float, help="单位：亿元")
-    p.add_argument("--min-revenue-yoy", type=float, help="营收同比下限 %")
-    p.add_argument("--min-profit-yoy", type=float, help="净利润同比下限 %")
+    # 技术指标过滤（需开启 --fetch-indicators）
+    p.add_argument("--fetch-indicators", action="store_true",
+                   help="为筛选结果补充技术指标（MA、尾盘、近期高低点等），较慢")
+    p.add_argument("--fetch-roe", action="store_true",
+                   help="同时获取 ROE（需要 --fetch-indicators，更慢）")
+    p.add_argument("--price-above-ma5",  action="store_true", help="价格在 MA5 上方")
+    p.add_argument("--price-above-ma10", action="store_true", help="价格在 MA10 上方")
+    p.add_argument("--price-above-ma20", action="store_true", help="价格在 MA20 上方")
+    p.add_argument("--ma5-trend-up", action="store_true", help="MA5 趋势向上")
+    p.add_argument("--tail-30min-positive", action="store_true",
+                   help="尾盘30分钟涨跌幅为正（需 --fetch-indicators）")
 
-    p.add_argument("--spot-retries", type=int, default=3, help="实时行情接口重试次数")
-    p.add_argument("--spot-retry-sleep", type=int, default=3, help="实时行情接口重试间隔秒数")
+    p.add_argument("--spot-retries", type=int, default=3)
+    p.add_argument("--spot-retry-sleep", type=int, default=3)
     p.add_argument("--low-rising", action="store_true",
                    help="补充近5日最低价并只保留近3天最低价单调递增的股票")
     p.add_argument("--data-source", type=str, default="auto",
                    choices=DATA_SOURCE_OPTIONS,
-                   help="数据来源: auto=自动, eastmoney=东方财富, sina=新浪财经（财报始终来自东方财富）")
+                   help="数据来源: auto=自动, eastmoney=东方财富, sina=新浪财经")
     return p
-
-
-def finance_only_mode(args):
-    report_df, used_date = fetch_report_data(report_date=args.report_date, include_bj=args.include_bj)
-    rows = report_df.to_dict(orient="records")
-    rows = [x for x in rows if pass_filters(x, args)]
-    rows.sort(key=lambda x: sort_value(x, args.sort_by), reverse=not args.ascending)
-    rows = rows[:args.top_n]
-
-    if getattr(args, "low_rising", False):
-        print(f"正在补充 {len(rows)} 只股票近5日最低价（并发请求）...")
-        rows = enrich_with_recent_lows(rows, days=5, data_source=getattr(args, "data_source", "auto"))
-        before_low = len(rows)
-        rows = [r for r in rows if pass_low_rising_filter(r)]
-        print(f"近3天最低价递增筛选后剩余 {len(rows)}/{before_low} 只")
-
-    print()
-    print(f"财报模式：使用报告期 {used_date}，筛选出 {len(rows)} 只股票")
-    print_table(rows)
-
-    csv_name = args.csv.strip() if args.csv else f"a_stock_finance_only_{used_date}_{now_str()}.csv"
-    csv_path = os.path.join(BASE_DIR, csv_name)
-    export_csv(rows, csv_path)
-    print()
-    print(f"结果已导出到: {csv_path}")
 
 
 def realtime_mode(args):
@@ -635,26 +585,45 @@ def realtime_mode(args):
                               include_bj=args.include_bj, data_source=data_source)
     print(f"实时行情拉取完成，共 {len(spot_df)} 只股票；来源: {spot_df.attrs.get('spot_source', '-')}")
 
-    print("开始拉取 akshare 财报数据...")
-    report_df, used_date = fetch_report_data(report_date=args.report_date, include_bj=args.include_bj)
-    print(f"财报数据拉取完成，共 {len(report_df)} 条；使用报告期: {used_date}")
-
-    merged = pd.merge(spot_df, report_df, on="code", how="left", suffixes=("", "_report"))
-    if "name_report" in merged.columns:
-        merged["name"] = merged["name"].fillna(merged["name_report"])
-        merged.drop(columns=["name_report"], inplace=True)
-
-    rows = merged.to_dict(orient="records")
+    rows = spot_df.to_dict(orient="records")
     rows = [x for x in rows if pass_filters(x, args)]
     rows.sort(key=lambda x: sort_value(x, args.sort_by), reverse=not args.ascending)
     rows = rows[:args.top_n]
+
+    # 主动添加的股票代码（跳过筛选）
+    add_codes_str = getattr(args, "add_codes", "") or ""
+    if add_codes_str.strip():
+        add_codes = [c.strip().zfill(6) for c in add_codes_str.split(",") if c.strip()]
+        existing_codes = {r["code"] for r in rows}
+        added = spot_df[spot_df["code"].isin(add_codes)].to_dict(orient="records")
+        for r in added:
+            if r["code"] not in existing_codes:
+                r["_manual"] = True
+                rows.append(r)
+                existing_codes.add(r["code"])
+        not_found = [c for c in add_codes if c not in {r["code"] for r in rows}]
+        if not_found:
+            print(f"注意：以下主动添加的股票未在行情中找到：{not_found}")
+        print(f"主动添加 {len([r for r in rows if r.get('_manual')])} 只股票")
 
     if getattr(args, "low_rising", False):
         print(f"正在补充 {len(rows)} 只股票近5日最低价（并发请求）...")
         rows = enrich_with_recent_lows(rows, days=5, data_source=getattr(args, "data_source", "auto"))
         before_low = len(rows)
         rows = [r for r in rows if pass_low_rising_filter(r)]
-        print(f"近3天最低价递增筛选后剩余 {len(rows)}/{before_low} 只")
+        skipped = sum(1 for r in rows if not any(r.get(f"low_{i}") is not None for i in range(1, 6)))
+        if skipped == before_low:
+            print(f"警告：K 线接口不可用，近3天最低价递增过滤已自动跳过")
+        else:
+            print(f"近3天最低价递增筛选后剩余 {len(rows)}/{before_low} 只")
+
+    if getattr(args, "fetch_indicators", False):
+        print(f"正在获取 {len(rows)} 只股票技术指标（MA、尾盘、高低点等）...")
+        fetch_roe = getattr(args, "fetch_roe", False)
+        rows = enrich_with_indicators(rows, fetch_tail=True, fetch_roe=fetch_roe,
+                                      progress_cb=lambda c, t, code: print(f"  [{c}/{t}] {code}"))
+        rows = [x for x in rows if pass_filters(x, args)]
+        print(f"指标过滤后剩余 {len(rows)} 只")
 
     print()
     print(f"最终选出 {len(rows)} 只股票：")
@@ -669,10 +638,7 @@ def realtime_mode(args):
 
 def main():
     args = build_parser().parse_args()
-    if args.finance_only:
-        finance_only_mode(args)
-    else:
-        realtime_mode(args)
+    realtime_mode(args)
 
 
 if __name__ == "__main__":

@@ -1,33 +1,28 @@
 {
   "_comment": "基金分析脚本配置文件 — 修改 data_source 切换数据来源",
-
   "data_source": "sina_cninfo",
   "_data_source_options": {
     "sina_cninfo": "新浪财经(ETF行情+历史) + 巨潮资讯(重仓股季报)  ← 公司网络受限时使用",
-    "eastmoney":   "东方财富(基金排行+个股持仓)                      ← 无网络限制时使用"
+    "eastmoney": "东方财富(基金排行+个股持仓)                      ← 无网络限制时使用"
   },
-
   "ssl_verify": false,
   "_ssl_verify_comment": "公司代理自签证书环境设 false；家庭/无限制网络设 true",
-
   "top_n": 10,
   "_top_n_comment": "每个时间段取前几名",
-
-  "fund_pool": ["011369", "022364"],
+  "fund_pool": [],
   "_fund_pool_comment": "场外基金代码池。sina_cninfo模式：通过新浪净值API计算收益率排行；eastmoney模式：通过东方财富API获取排行（fund_pool用于补充对比）。建议添加50-200只基金代码以获得更全面的排行",
-
-  "fund_types": ["股票型", "混合型"],
+  "fund_types": [
+    "股票型",
+    "混合型"
+  ],
   "_fund_types_comment": "eastmoney 模式下：参与排行的基金类型",
-
   "include_etf": true,
   "_include_etf_comment": "是否同时分析场内ETF排行（仅sina_cninfo模式生效）",
-
-  "etf_sample": 100,
+  "etf_sample": 10,
   "_etf_sample_comment": "include_etf为true时：取市值前多少只ETF计算收益率",
-
   "compare_dates": {
-    "current_quarter": "20250331",
-    "prev_quarter":    "20241231"
+    "current_quarter": "20260401",
+    "prev_quarter": "20251231"
   },
   "_compare_dates_comment": "季报对比日期；格式 YYYYMMDD，限 0331/0630/0930/1231"
 }

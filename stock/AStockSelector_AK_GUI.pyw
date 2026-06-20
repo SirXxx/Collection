@@ -2,21 +2,17 @@
 """
 AStockSelector_AK_GUI.pyw
 
-akshare A 股筛选桌面版：
-- 可视化输入筛选参数
-- 自动保存 / 手动保存参数
-- 结果表格展示
-- 自动导出 CSV + Excel
-- 尽量复用 AStockSelector_AK.py 的已有抓取/筛选逻辑
+akshare A 股筛选框架 — 多标签塔桌版
 
-说明：
-- 当前网络环境下，实时行情接口可能失败；可勾选“仅财报模式”先使用财报筛选。
-- 参数保存在同目录 AStockSelector_AK_GUI_config.json
-- 导出结果默认保存到脚本同目录
+[筛选器]  可视化输入条件、实时行情+财报筛选、导出 CSV/Excel
+[自选列表] 将筛选结果加入自选（SQLite 持久化）
+[次日跟踪] 手动/定时拍取自选股票第二天实时行情
+[统计分析] 展示胜率趋势和条件相关性图表
 """
 
 import json
 import os
+import sys
 import threading
 import traceback
 import queue
@@ -25,95 +21,125 @@ from datetime import datetime
 
 import pandas as pd
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, simpledialog
 
 import AStockSelector_AK as core
+import db
+import watchlist_manager as wm
+import tracker
+import scheduler
+import stats
+
+# matplotlib 可选导入
+try:
+    import matplotlib
+    matplotlib.use("TkAgg")
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    from matplotlib.figure import Figure
+    import matplotlib.pyplot as plt
+    plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "Arial"]
+    plt.rcParams["axes.unicode_minus"] = False
+    _MPL_AVAILABLE = True
+except ImportError:
+    _MPL_AVAILABLE = False
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "AStockSelector_AK_GUI_config.json")
 
 SORT_OPTIONS = [
     "price", "pct_chg", "volume", "volume_ratio", "turnover",
-    "market_cap", "circ_market_cap", "pe", "eps", "revenue",
-    "net_profit", "revenue_yoy", "profit_yoy"
+    "market_cap", "circ_market_cap", "pe", "pb", "eps", "roe",
+    "revenue", "net_profit", "revenue_yoy", "profit_yoy",
+    "ma5", "tail_30min_pct",
 ]
 
 DATA_SOURCE_OPTIONS = core.DATA_SOURCE_OPTIONS  # ["auto", "eastmoney", "sina"]
 
-# 下拉选择型字段 → 选项列表
 CHOICE_OPTIONS = {
     "sort_by":     SORT_OPTIONS,
     "data_source": DATA_SOURCE_OPTIONS,
 }
 
 RESULT_COLUMNS = [
-    ("code", "代码", 80),
-    ("name", "名称", 110),
-    ("price", "现价", 80),
-    ("pct_chg", "涨跌幅%", 90),
-    ("low_1", "最低_1", 75),
-    ("low_2", "最低_2", 75),
-    ("low_3", "最低_3", 75),
-    ("low_4", "最低_4", 75),
-    ("low_5", "最低_5", 75),
-    ("volume", "成交量", 100),
-    ("volume_ratio", "量比", 80),
-    ("turnover", "换手%", 80),
-    ("market_cap", "总市值(亿)", 100),
-    ("pe", "PE", 80),
-    ("eps", "EPS", 80),
-    ("revenue", "营收(亿)", 100),
-    ("net_profit", "净利润(亿)", 100),
-    ("revenue_yoy", "营收同比%", 100),
-    ("profit_yoy", "利润同比%", 100),
-    ("industry", "行业", 120),
-    ("notice_date", "公告日", 100),
-    ("report_date", "报告期", 90),
+    ("code",          "代码",       80),
+    ("name",          "名称",      110),
+    ("price",         "现价",       80),
+    ("pct_chg",       "涨跌幅%",     90),
+    ("today_high",    "今日最高",     80),
+    ("today_low",     "今日最低",     80),
+    ("low_1",         "最低_1",      75),
+    ("low_2",         "最低_2",      75),
+    ("low_3",         "最低_3",      75),
+    ("low_4",         "最低_4",      75),
+    ("low_5",         "最低_5",      75),
+    ("ma5",           "MA5",        80),
+    ("ma10",          "MA10",       80),
+    ("ma20",          "MA20",       80),
+    ("ma5_trend",     "MA5趋势",    80),
+    ("tail_30min_pct","尾盘30min%",  90),
+    ("volume",        "成交量",     100),
+    ("volume_ratio",  "量比",       80),
+    ("turnover",      "换手%",      80),
+    ("market_cap",    "总市值(亿)",  100),
+    ("pe",            "PE",         80),
+    ("pb",            "PB",         75),
+    ("eps",           "EPS",        80),
+    ("roe",           "ROE%",       80),
+    ("revenue",       "营收(亿)",   100),
+    ("net_profit",    "净利润(亿)",  100),
+    ("revenue_yoy",   "营收同比%",    100),
+    ("profit_yoy",    "利润同比%",    100),
+    ("industry",      "行业",      120),
+    ("notice_date",   "公告日",     100),
+    ("report_date",   "报告期",      90),
 ]
 
 FIELD_DEFS = [
-    ("top_n", "输出数量 Top N", "int", 20),
-    ("sort_by", "排序字段", "choice", "pct_chg"),
-    ("ascending", "升序排序", "bool", False),
-    ("finance_only", "仅财报模式", "bool", True),
-    ("report_date", "指定报告期(如 20241231)", "str", ""),
-    ("include_bj", "包含北交所", "bool", False),
-    ("data_source", "数据来源", "choice", "auto"),
-    ("export_name", "导出文件名前缀(可空)", "str", ""),
-    ("spot_retries", "实时行情重试次数", "int", 3),
-    ("spot_retry_sleep", "实时行情重试间隔秒", "int", 3),
+    ("top_n",            "输出数量 Top N",               "int",    20),
+    ("sort_by",           "排序字段",                   "choice", "pct_chg"),
+    ("ascending",         "升序排序",                   "bool",   False),
+    ("add_codes",         "主动添加股票(逗号分隔)",         "str",    ""),
+    ("include_bj",        "包含北交所",                 "bool",   False),
+    ("data_source",       "数据来源",                   "choice", "auto"),
+    ("export_name",       "导出文件名前缀(可空)",      "str",    ""),
+    ("spot_retries",      "实时行情重试次数",           "int",    3),
+    ("spot_retry_sleep",  "实时行情重试间隔秒",           "int",    3),
 
-    ("min_price", "最低价格", "float", ""),
-    ("max_price", "最高价格", "float", ""),
-    ("min_pct_chg", "最小涨跌幅%", "float", ""),
-    ("max_pct_chg", "最大涨跌幅%", "float", ""),
-    ("min_volume", "最小成交量", "float", ""),
-    ("min_volume_ratio", "最小量比", "float", ""),
-    ("max_volume_ratio", "最大量比", "float", ""),
-    ("min_turnover", "最小换手率%", "float", ""),
-    ("max_turnover", "最大换手率%", "float", ""),
-    ("min_market_cap", "最小市值(亿)", "float", ""),
-    ("max_market_cap", "最大市值(亿)", "float", ""),
-    ("min_pe", "最小 PE", "float", ""),
-    ("max_pe", "最大 PE", "float", ""),
-    ("min_eps", "最小 EPS", "float", ""),
-    ("min_net_profit", "最小净利润(亿)", "float", ""),
-    ("min_revenue_yoy", "最小营收同比%", "float", ""),
-    ("min_profit_yoy", "最小净利润同比%", "float", ""),
-    ("low_rising", "近3天最低价递增", "bool", False),
+    ("min_price",         "最低价格",                   "float",  ""),
+    ("max_price",         "最高价格",                   "float",  ""),
+    ("min_pct_chg",       "最小涨跌幅%",               "float",  ""),
+    ("max_pct_chg",       "最大涨跌幅%",               "float",  ""),
+    ("min_volume",        "最小成交量",               "float",  ""),
+    ("min_volume_ratio",  "最小量比",                 "float",  ""),
+    ("max_volume_ratio",  "最大量比",                 "float",  ""),
+    ("min_turnover",      "最小换手率%",               "float",  ""),
+    ("max_turnover",      "最大换手率%",               "float",  ""),
+    ("min_market_cap",    "最小市值(亿)",              "float",  ""),
+    ("max_market_cap",    "最大市值(亿)",              "float",  ""),
+    ("min_pe",            "最小 PE",                    "float",  ""),
+    ("max_pe",            "最大 PE",                    "float",  ""),
+    ("max_pb",            "最大 PB",                    "float",  ""),
+    ("min_roe",           "最小 ROE%",                  "float",  ""),
+    ("low_rising",        "近3天最低价递增",             "bool",   False),
+    ("fetch_indicators",  "获取技术指标(MA、尾盘等)",   "bool",   False),
+    ("fetch_roe",         "同时获取 ROE",               "bool",   False),
+    ("price_above_ma5",   "价格在 MA5 上方",             "bool",   False),
+    ("price_above_ma10",  "价格在 MA10 上方",            "bool",   False),
+    ("price_above_ma20",  "价格在 MA20 上方",            "bool",   False),
+    ("ma5_trend_up",      "MA5 趋势向上",              "bool",   False),
+    ("tail_30min_positive","尾盘30min趋势为正",          "bool",   False),
 ]
 
-# 范围型字段对：(min_key, max_key) -> 显示标签
 RANGE_LABELS = {
-    ("min_pct_chg",    "max_pct_chg"):    "涨幅范围%",
-    ("min_volume_ratio", "max_volume_ratio"): "量比范围",
-    ("min_turnover",   "max_turnover"):   "换手率范围%",
-    ("min_market_cap", "max_market_cap"): "市值范围(亿)",
+    ("min_pct_chg",       "max_pct_chg"):      "涨幅范围%",
+    ("min_volume_ratio",  "max_volume_ratio"):  "量比范围",
+    ("min_turnover",      "max_turnover"):      "换手率范围%",
+    ("min_market_cap",    "max_market_cap"):    "市值范围(亿)",
 }
 
 SECTION_LAYOUT = [
     ("基础参数", [
-        "top_n", "sort_by", "ascending", "finance_only", "report_date",
+        "top_n", "sort_by", "ascending", "add_codes",
         "include_bj", "data_source", "export_name", "spot_retries", "spot_retry_sleep"
     ]),
     ("行情条件", [
@@ -123,10 +149,12 @@ SECTION_LAYOUT = [
         ("min_volume_ratio", "max_volume_ratio"),
         ("min_turnover", "max_turnover"),
         ("min_market_cap", "max_market_cap"),
-        "min_pe", "max_pe", "low_rising"
+        "min_pe", "max_pe", "max_pb", "min_roe", "low_rising"
     ]),
-    ("财报条件", [
-        "min_eps", "min_net_profit", "min_revenue_yoy", "min_profit_yoy"
+    ("技术指标", [
+        "fetch_indicators", "fetch_roe",
+        "price_above_ma5", "price_above_ma10", "price_above_ma20",
+        "ma5_trend_up", "tail_30min_positive",
     ]),
 ]
 
@@ -204,22 +232,24 @@ def export_dataframe(df, prefix, finance_only, used_date):
 
 
 class SelectorApp:
-    BG = "#F4F7FB"
-    PANEL = "#FFFFFF"
-    BORDER = "#D9E2EF"
-    TITLE = "#1F3B5B"
-    TEXT = "#243447"
+    BG      = "#F4F7FB"
+    PANEL   = "#FFFFFF"
+    BORDER  = "#D9E2EF"
+    TITLE   = "#1F3B5B"
+    TEXT    = "#243447"
     SUBTEXT = "#5B6B7A"
-    ACCENT = "#3B82F6"
+    ACCENT  = "#3B82F6"
     SUCCESS = "#16A34A"
-    WARN = "#B45309"
-    ERROR = "#DC2626"
+    WARN    = "#B45309"
+    ERROR   = "#DC2626"
+    UP      = "#16A34A"
+    DOWN    = "#DC2626"
 
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("A股筛选器 AK GUI")
-        self.root.geometry("1360x820+80+50")
-        self.root.minsize(1180, 700)
+        self.root.title("A股筛选器 v2")
+        self.root.geometry("1420x880+60+40")
+        self.root.minsize(1200, 700)
         self.root.configure(bg=self.BG)
 
         self.config_data = load_config()
@@ -232,10 +262,24 @@ class SelectorApp:
         self.running = False
         self.ui_queue = queue.Queue()
 
+        # 次日跟踪状态
+        self.track_date_var = tk.StringVar()
+        self.scheduler_on = tk.BooleanVar(value=False)
+
+        # 统计分析状态
+        self.stats_threshold_var = tk.StringVar(value="1.0")
+        self.stats_days_var = tk.StringVar(value="30")
+        self.stats_label_var = tk.StringVar(value="close")
+
         self._build_style()
         self._build_ui()
         self._load_to_form(self.config_data)
         self.root.after(200, self._poll_queue)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _on_close(self):
+        scheduler.stop()
+        self.root.destroy()
 
     def _build_style(self):
         style = ttk.Style()
@@ -250,55 +294,83 @@ class SelectorApp:
         top = tk.Frame(self.root, bg=self.BG)
         top.pack(fill="x", padx=14, pady=(12, 6))
 
-        title = tk.Label(top, text="A 股股票筛选器（akshare 桌面版）", bg=self.BG, fg=self.TITLE,
+        title = tk.Label(top, text="A 股筛选系统 v2", bg=self.BG, fg=self.TITLE,
                          font=("Microsoft YaHei UI", 16, "bold"))
         title.pack(anchor="w")
 
-        subtitle = tk.Label(
-            top,
-            text="可视化输入条件、自动保存参数、展示结果并导出 CSV / Excel。当前环境若实时行情失败，可勾选“仅财报模式”。",
-            bg=self.BG,
-            fg=self.SUBTEXT,
-            font=("Microsoft YaHei UI", 9)
-        )
+        subtitle = tk.Label(top, text="筛选器 · 自选列表 · 次日跟踪 · 策略统计",
+                            bg=self.BG, fg=self.SUBTEXT, font=("Microsoft YaHei UI", 9))
         subtitle.pack(anchor="w", pady=(4, 0))
 
-        toolbar = tk.Frame(self.root, bg=self.BG)
-        toolbar.pack(fill="x", padx=14, pady=(0, 8))
+        status_bar = tk.Frame(self.root, bg=self.BG)
+        status_bar.pack(fill="x", padx=14, pady=(2, 2))
+        self.status_var = tk.StringVar(value="就绪")
+        tk.Label(status_bar, textvariable=self.status_var, bg=self.BG, fg=self.SUBTEXT,
+                 font=("Microsoft YaHei UI", 9)).pack(side="right")
 
-        self.run_btn = tk.Button(toolbar, text="运行筛选", command=self.run_selection,
+        nb = ttk.Notebook(self.root)
+        nb.pack(fill="both", expand=True, padx=14, pady=(0, 12))
+        self._nb = nb
+
+        tab1 = tk.Frame(nb, bg=self.BG)
+        tab2 = tk.Frame(nb, bg=self.BG)
+        tab3 = tk.Frame(nb, bg=self.BG)
+        tab4 = tk.Frame(nb, bg=self.BG)
+        nb.add(tab1, text="  筛选器  ")
+        nb.add(tab2, text="  自选列表  ")
+        nb.add(tab3, text="  次日跟踪  ")
+        nb.add(tab4, text="  统计分析  ")
+        nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
+        self._build_screener_tab(tab1)
+        self._build_watchlist_tab(tab2)
+        self._build_tracking_tab(tab3)
+        self._build_stats_tab(tab4)
+
+    def _on_tab_changed(self, event):
+        idx = self._nb.index("current")
+        if idx == 1:
+            self._refresh_watchlist()
+        elif idx == 2:
+            self._refresh_tracking_dates()
+
+    def _build_screener_tab(self, parent):
+        toolbar = tk.Frame(parent, bg=self.BG)
+        toolbar.pack(fill="x", padx=8, pady=(8, 4))
+
+        self.run_btn = tk.Button(toolbar, text="▶ 运行筛选", command=self.run_selection,
                                  bg=self.ACCENT, fg="white", relief="flat", padx=16, pady=6,
                                  font=("Microsoft YaHei UI", 10, "bold"), cursor="hand2")
         self.run_btn.pack(side="left")
 
         tk.Button(toolbar, text="保存参数", command=self.save_current_config,
                   bg="#E5EEF9", fg=self.TEXT, relief="flat", padx=12, pady=6,
-                  font=("Microsoft YaHei UI", 9), cursor="hand2").pack(side="left", padx=8)
-
+                  font=("Microsoft YaHei UI", 9), cursor="hand2").pack(side="left", padx=6)
         tk.Button(toolbar, text="重载参数", command=self.reload_config,
                   bg="#E5EEF9", fg=self.TEXT, relief="flat", padx=12, pady=6,
                   font=("Microsoft YaHei UI", 9), cursor="hand2").pack(side="left")
-
         tk.Button(toolbar, text="重置默认", command=self.reset_defaults,
                   bg="#F3F4F6", fg=self.TEXT, relief="flat", padx=12, pady=6,
-                  font=("Microsoft YaHei UI", 9), cursor="hand2").pack(side="left", padx=8)
-
-        tk.Button(toolbar, text="导出当前结果", command=self.export_current_result,
+                  font=("Microsoft YaHei UI", 9), cursor="hand2").pack(side="left", padx=6)
+        tk.Button(toolbar, text="导出结果", command=self.export_current_result,
                   bg="#DCFCE7", fg="#166534", relief="flat", padx=12, pady=6,
                   font=("Microsoft YaHei UI", 9), cursor="hand2").pack(side="left")
 
-        self.status_var = tk.StringVar(value="就绪")
-        tk.Label(toolbar, textvariable=self.status_var, bg=self.BG, fg=self.SUBTEXT,
-                 font=("Microsoft YaHei UI", 9)).pack(side="right")
+        self.add_wl_btn = tk.Button(toolbar, text="★ 全部加入自选",
+                                    command=self._add_all_to_watchlist,
+                                    bg="#FEF9C3", fg="#713F12", relief="flat", padx=12, pady=6,
+                                    font=("Microsoft YaHei UI", 9, "bold"), cursor="hand2",
+                                    state="disabled")
+        self.add_wl_btn.pack(side="left", padx=6)
 
-        body = tk.PanedWindow(self.root, orient="horizontal", sashrelief="flat", sashwidth=6,
+        body = tk.PanedWindow(parent, orient="horizontal", sashrelief="flat", sashwidth=6,
                               bg=self.BG, bd=0)
-        body.pack(fill="both", expand=True, padx=14, pady=(0, 12))
+        body.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
-        left_wrap = tk.Frame(body, bg=self.PANEL, bd=1, relief="solid", highlightthickness=0)
+        left_wrap  = tk.Frame(body, bg=self.PANEL, bd=1, relief="solid", highlightthickness=0)
         right_wrap = tk.Frame(body, bg=self.PANEL, bd=1, relief="solid", highlightthickness=0)
-        body.add(left_wrap, minsize=360)
-        body.add(right_wrap, minsize=700)
+        body.add(left_wrap,  minsize=360)
+        body.add(right_wrap, minsize=740)
 
         self._build_form_panel(left_wrap)
         self._build_result_panel(right_wrap)
@@ -432,24 +504,6 @@ class SelectorApp:
     def _queue_log(self, text):
         self.ui_queue.put(("log", text))
 
-    def _poll_queue(self):
-        try:
-            while True:
-                item = self.ui_queue.get_nowait()
-                kind = item[0]
-                if kind == "log":
-                    self._append_log(item[1])
-                elif kind == "status":
-                    self.status_var.set(item[1])
-                elif kind == "done":
-                    payload = item[1]
-                    self._handle_done(payload)
-                elif kind == "error":
-                    self._handle_error(item[1])
-        except queue.Empty:
-            pass
-        self.root.after(200, self._poll_queue)
-
     def _load_to_form(self, data):
         for key, var in self.vars.items():
             value = data.get(key, DEFAULTS.get(key))
@@ -499,8 +553,7 @@ class SelectorApp:
             sort_by=data.get("sort_by") or "pct_chg",
             ascending=bool(data.get("ascending")),
             csv="",
-            report_date=data.get("report_date", ""),
-            finance_only=bool(data.get("finance_only")),
+            add_codes=data.get("add_codes", ""),
             include_bj=bool(data.get("include_bj")),
             min_price=parse_float("min_price"),
             max_price=parse_float("max_price"),
@@ -515,13 +568,18 @@ class SelectorApp:
             max_market_cap=parse_float("max_market_cap"),
             min_pe=parse_float("min_pe"),
             max_pe=parse_float("max_pe"),
-            min_eps=parse_float("min_eps"),
-            min_net_profit=parse_float("min_net_profit"),
-            min_revenue_yoy=parse_float("min_revenue_yoy"),
-            min_profit_yoy=parse_float("min_profit_yoy"),
+            max_pb=parse_float("max_pb"),
+            min_roe=parse_float("min_roe"),
             spot_retries=parse_int("spot_retries", 3),
             spot_retry_sleep=parse_int("spot_retry_sleep", 3),
             low_rising=bool(data.get("low_rising")),
+            fetch_indicators=bool(data.get("fetch_indicators")),
+            fetch_roe=bool(data.get("fetch_roe")),
+            price_above_ma5=bool(data.get("price_above_ma5")),
+            price_above_ma10=bool(data.get("price_above_ma10")),
+            price_above_ma20=bool(data.get("price_above_ma20")),
+            ma5_trend_up=bool(data.get("ma5_trend_up")),
+            tail_30min_positive=bool(data.get("tail_30min_positive")),
             data_source=data.get("data_source", "auto") or "auto",
         )
 
@@ -571,41 +629,20 @@ class SelectorApp:
     def _worker_run(self, args, export_prefix):
         try:
             self.ui_queue.put(("status", "正在拉取与筛选数据..."))
-            self._queue_log(f"模式：{'仅财报模式' if args.finance_only else '实时行情 + 财报模式'}，数据来源：{args.data_source}")
-            if args.report_date:
-                self._queue_log(f"指定报告期：{args.report_date}")
+            self._queue_log(f"模式：实时行情，数据来源：{args.data_source}")
             self._queue_log(f"排序字段：{args.sort_by}，{'升序' if args.ascending else '降序'}")
 
-            if args.finance_only:
-                self._queue_log("开始拉取财报数据...")
-                report_df, used_date = core.fetch_report_data(
-                    report_date=args.report_date,
-                    include_bj=args.include_bj,
-                )
-                rows = report_df.to_dict(orient="records")
-                self._queue_log(f"财报数据拉取完成，共 {len(rows)} 条，使用报告期：{used_date}")
-            else:
-                self._queue_log("开始拉取实时行情...")
-                spot_df = core.fetch_spot_data(
-                    retries=args.spot_retries,
-                    sleep_sec=args.spot_retry_sleep,
-                    include_bj=args.include_bj,
-                    data_source=args.data_source,
-                )
-                self._queue_log(
-                    f"实时行情完成，共 {len(spot_df)} 条；来源：{spot_df.attrs.get('spot_source', '-') }"
-                )
-                self._queue_log("开始拉取财报数据...")
-                report_df, used_date = core.fetch_report_data(
-                    report_date=args.report_date,
-                    include_bj=args.include_bj,
-                )
-                self._queue_log(f"财报数据完成，共 {len(report_df)} 条，使用报告期：{used_date}")
-                merged = pd.merge(spot_df, report_df, on="code", how="left", suffixes=("", "_report"))
-                if "name_report" in merged.columns:
-                    merged["name"] = merged["name"].fillna(merged["name_report"])
-                    merged.drop(columns=["name_report"], inplace=True)
-                rows = merged.to_dict(orient="records")
+            self._queue_log("开始拉取实时行情...")
+            spot_df = core.fetch_spot_data(
+                retries=args.spot_retries,
+                sleep_sec=args.spot_retry_sleep,
+                include_bj=args.include_bj,
+                data_source=args.data_source,
+            )
+            self._queue_log(
+                f"实时行情完成，共 {len(spot_df)} 条；来源：{spot_df.attrs.get('spot_source', '-')}"
+            )
+            rows = spot_df.to_dict(orient="records")
 
             before_count = len(rows)
             rows = [x for x in rows if core.pass_filters(x, args)]
@@ -613,12 +650,38 @@ class SelectorApp:
             rows = rows[:args.top_n]
             self._queue_log(f"筛选前 {before_count} 条，筛选后 {len(rows)} 条，取前 {args.top_n} 条")
 
+            # 主动添加股票（跳过筛选）
+            add_codes_str = (args.add_codes or "").strip()
+            if add_codes_str:
+                add_codes = [c.strip().zfill(6) for c in add_codes_str.split(",") if c.strip()]
+                existing = {r["code"] for r in rows}
+                added_rows = spot_df[spot_df["code"].isin(add_codes)].to_dict(orient="records")
+                added_count = 0
+                for r in added_rows:
+                    if r["code"] not in existing:
+                        r["_manual"] = True
+                        rows.append(r)
+                        existing.add(r["code"])
+                        added_count += 1
+                not_found = [c for c in add_codes if c not in {r["code"] for r in rows}]
+                self._queue_log(f"主动添加 {added_count} 只股票" +
+                                (f"；未找到：{not_found}" if not_found else ""))
+
+            used_date = ""
+
             if getattr(args, "low_rising", False):
                 self._queue_log(f"正在补充 {len(rows)} 只股票的近5日最低价（并发请求，请稍候）...")
                 rows = core.enrich_with_recent_lows(rows, days=5, data_source=args.data_source)
                 before_low = len(rows)
                 rows = [r for r in rows if core.pass_low_rising_filter(r)]
-                self._queue_log(f"近3天最低价递增筛选后剩余 {len(rows)}/{before_low} 只")
+                api_failed = all(
+                    not any(r.get(f"low_{i}") is not None for i in range(1, 6))
+                    for r in rows
+                ) if rows else False
+                if api_failed:
+                    self._queue_log("⚠ K线接口不可用，近3天最低价递增过滤已自动跳过（结果为行情筛选结果）")
+                else:
+                    self._queue_log(f"近3天最低价递增筛选后剩余 {len(rows)}/{before_low} 只")
 
             df = pd.DataFrame(rows)
             if df.empty:
@@ -642,7 +705,8 @@ class SelectorApp:
                 "used_date": used_date,
                 "csv_path": csv_path,
                 "xlsx_path": xlsx_path,
-                "finance_only": args.finance_only,
+                "finance_only": False,
+                "fetch_report": False,
             }))
         except Exception as e:
             detail = f"{e}\n\n{traceback.format_exc()}"
@@ -655,7 +719,6 @@ class SelectorApp:
         self.last_csv_path = payload.get("csv_path", "")
         self.last_xlsx_path = payload.get("xlsx_path", "") or ""
 
-        # 更新近5日最低价列标题（显示实际日期）
         if self.result_rows:
             first = self.result_rows[0]
             for idx in range(1, 6):
@@ -664,13 +727,17 @@ class SelectorApp:
                 self.tree.heading(f"low_{idx}", text=label)
 
         self._refresh_tree()
-        mode_text = "仅财报" if payload.get("finance_only") else "实时+财报"
+        mode_text = "实时行情"
         self.result_summary_var.set(
             f"模式：{mode_text} | 结果：{len(self.result_rows)} 条 | 报告期：{self.last_used_date or '-'}"
         )
         self.status_var.set("运行完成")
         self.run_btn.configure(state="normal")
         self.running = False
+
+        # 激活"加入自选"按钮
+        if self.result_rows:
+            self.add_wl_btn.configure(state="normal")
 
         msg = f"筛选完成，共 {len(self.result_rows)} 条。\n\nCSV：{self.last_csv_path}"
         if self.last_xlsx_path:
@@ -694,16 +761,19 @@ class SelectorApp:
             values = []
             for col, _title, _width in RESULT_COLUMNS:
                 v = row.get(col)
-                if col in ("price", "pct_chg", "volume_ratio", "turnover", "market_cap", "pe", "eps", "revenue", "net_profit", "revenue_yoy", "profit_yoy",
+                if col in ("price", "pct_chg", "volume_ratio", "turnover", "market_cap", "pe", "pb", "roe",
                            "low_1", "low_2", "low_3", "low_4", "low_5"):
                     values.append(format_value(v, 2))
                 elif col == "volume":
                     values.append(format_value(v, 0))
-                elif col in ("notice_date", "report_date"):
-                    values.append(str(v or "")[:10])
+                elif col == "_manual":
+                    values.append("★" if v else "")
                 else:
                     values.append("" if v is None else str(v))
-            self.tree.insert("", "end", values=values)
+            tags = ("manual",) if row.get("_manual") else ()
+            self.tree.insert("", "end", values=values, tags=tags)
+
+        self.tree.tag_configure("manual", background="#FFF9E6")
 
     def export_current_result(self):
         if self.result_df is None or self.result_df.empty:
@@ -714,7 +784,7 @@ class SelectorApp:
             csv_path, xlsx_path = export_dataframe(
                 self.result_df,
                 prefix,
-                bool(self.vars["finance_only"].get()),
+                False,
                 self.last_used_date,
             )
             self.last_csv_path = csv_path
@@ -725,6 +795,493 @@ class SelectorApp:
             messagebox.showinfo("导出完成", f"CSV：{csv_path}" + (f"\nExcel：{xlsx_path}" if xlsx_path else ""))
         except Exception as e:
             messagebox.showerror("导出失败", str(e))
+
+    # ── 加入自选 ────────────────────────────────────────────────────
+    def _add_all_to_watchlist(self):
+        if not self.result_rows:
+            messagebox.showinfo("提示", "当前没有筛选结果。")
+            return
+        n = wm.add_rows_to_watchlist(self.result_rows, enrich=False)
+        if n > 0:
+            self.status_var.set(f"已加入 {n} 只股票到自选")
+            self._append_log(f"加入自选：{n} 只股票（今日 {datetime.now().strftime('%Y-%m-%d')}）")
+            messagebox.showinfo("完成", f"已将 {n} 只股票加入自选列表。\n（已存在的股票自动跳过）")
+        else:
+            messagebox.showinfo("提示", "所有股票已在今日自选中，无新增。")
+
+    # ── ② 自选列表 Tab ──────────────────────────────────────────────
+    def _build_watchlist_tab(self, parent):
+        # 工具栏
+        tb = tk.Frame(parent, bg=self.BG)
+        tb.pack(fill="x", padx=8, pady=(8, 4))
+
+        tk.Label(tb, text="日期:", bg=self.BG, fg=self.TEXT,
+                 font=("Microsoft YaHei UI", 9)).pack(side="left")
+        self.wl_date_var = tk.StringVar()
+        self.wl_date_cb = ttk.Combobox(tb, textvariable=self.wl_date_var,
+                                        state="readonly", width=14)
+        self.wl_date_cb.pack(side="left", padx=6)
+        self.wl_date_cb.bind("<<ComboboxSelected>>", lambda e: self._refresh_watchlist())
+
+        tk.Button(tb, text="刷新", command=self._refresh_watchlist,
+                  bg="#E5EEF9", fg=self.TEXT, relief="flat", padx=10, pady=5,
+                  font=("Microsoft YaHei UI", 9), cursor="hand2").pack(side="left", padx=4)
+        tk.Button(tb, text="删除选中", command=self._delete_watchlist_selected,
+                  bg="#FEE2E2", fg=self.ERROR, relief="flat", padx=10, pady=5,
+                  font=("Microsoft YaHei UI", 9), cursor="hand2").pack(side="left", padx=4)
+        tk.Button(tb, text="手动添加代码", command=self._manual_add_watchlist,
+                  bg="#F0FDF4", fg="#166534", relief="flat", padx=10, pady=5,
+                  font=("Microsoft YaHei UI", 9), cursor="hand2").pack(side="left", padx=4)
+
+        self.wl_count_var = tk.StringVar(value="")
+        tk.Label(tb, textvariable=self.wl_count_var, bg=self.BG, fg=self.SUBTEXT,
+                 font=("Microsoft YaHei UI", 9)).pack(side="right")
+
+        # 表格
+        wrap = tk.Frame(parent, bg=self.PANEL)
+        wrap.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+        wl_cols = [
+            ("code", "代码", 80), ("name", "名称", 100), ("add_date", "加入日期", 90),
+            ("add_price", "加入价", 80), ("add_pct_chg", "加入涨跌%", 90),
+            ("ma5", "MA5", 75), ("ma10", "MA10", 75), ("ma20", "MA20", 75),
+            ("above_ma5", "在MA5上", 65), ("ma5_trend", "MA5趋势", 70),
+            ("tail_30min_pct", "尾盘30min%", 90),
+            ("volume_ratio", "量比", 65), ("turnover", "换手%", 65),
+            ("market_cap", "市值(亿)", 90), ("pe", "PE", 65), ("pb", "PB", 65),
+            ("roe", "ROE%", 65), ("eps", "EPS", 65),
+            ("revenue_yoy", "营收同比%", 90), ("profit_yoy", "利润同比%", 90),
+            ("industry", "行业", 110), ("note", "备注", 100),
+        ]
+        self._wl_cols = wl_cols
+        cols = [c[0] for c in wl_cols]
+        self.wl_tree = ttk.Treeview(wrap, columns=cols, show="headings")
+        vsb = ttk.Scrollbar(wrap, orient="vertical",   command=self.wl_tree.yview)
+        hsb = ttk.Scrollbar(wrap, orient="horizontal", command=self.wl_tree.xview)
+        self.wl_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        for col, title, width in wl_cols:
+            self.wl_tree.heading(col, text=title)
+            self.wl_tree.column(col, width=width, minwidth=50, anchor="center")
+        self.wl_tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        wrap.rowconfigure(0, weight=1)
+        wrap.columnconfigure(0, weight=1)
+
+        # 存储 id 映射
+        self._wl_id_map = {}   # tree iid -> db watchlist id
+
+    def _refresh_watchlist(self):
+        dates = wm.get_dates()
+        self.wl_date_cb["values"] = dates
+        if not self.wl_date_var.get() and dates:
+            self.wl_date_var.set(dates[0])
+
+        date_str = self.wl_date_var.get()
+        if not date_str:
+            return
+
+        items = wm.get_by_date(date_str)
+        for row in self.wl_tree.get_children():
+            self.wl_tree.delete(row)
+        self._wl_id_map.clear()
+
+        for item in items:
+            values = []
+            for col, _title, _width in self._wl_cols:
+                v = item.get(col)
+                if col in ("add_price", "ma5", "ma10", "ma20",
+                           "add_pct_chg", "tail_30min_pct", "volume_ratio",
+                           "turnover", "market_cap", "pe", "pb", "roe",
+                           "eps", "revenue_yoy", "profit_yoy"):
+                    values.append(format_value(v, 2))
+                elif col == "above_ma5":
+                    values.append("是" if v == 1 else ("否" if v == 0 else "-"))
+                else:
+                    values.append("" if v is None else str(v))
+            iid = self.wl_tree.insert("", "end", values=values)
+            self._wl_id_map[iid] = item["id"]
+
+        self.wl_count_var.set(f"共 {len(items)} 只")
+
+    def _delete_watchlist_selected(self):
+        sel = self.wl_tree.selection()
+        if not sel:
+            messagebox.showinfo("提示", "请先选择要删除的股票。")
+            return
+        if not messagebox.askyesno("确认", f"确定删除选中的 {len(sel)} 条记录？"):
+            return
+        for iid in sel:
+            db_id = self._wl_id_map.get(iid)
+            if db_id:
+                wm.remove(db_id)
+        self._refresh_watchlist()
+
+    def _manual_add_watchlist(self):
+        code = simpledialog.askstring("手动添加", "请输入股票代码（6位数字）：",
+                                       parent=self.root)
+        if not code:
+            return
+        code = str(code).strip().zfill(6)
+        ok = wm.add_manual(code)
+        if ok:
+            messagebox.showinfo("完成", f"股票 {code} 已加入今日自选。")
+        else:
+            messagebox.showinfo("提示", f"股票 {code} 今日已在自选列表中。")
+        self._refresh_watchlist()
+
+    # ── ③ 次日跟踪 Tab ──────────────────────────────────────────────
+    def _build_tracking_tab(self, parent):
+        # 工具栏
+        tb = tk.Frame(parent, bg=self.BG)
+        tb.pack(fill="x", padx=8, pady=(8, 4))
+
+        tk.Label(tb, text="跟踪日期:", bg=self.BG, fg=self.TEXT,
+                 font=("Microsoft YaHei UI", 9)).pack(side="left")
+        self.track_date_cb = ttk.Combobox(tb, textvariable=self.track_date_var,
+                                           state="readonly", width=14)
+        self.track_date_cb.pack(side="left", padx=6)
+        self.track_date_cb.bind("<<ComboboxSelected>>", lambda e: self._refresh_tracking_table())
+
+        tk.Label(tb, text="标签:", bg=self.BG, fg=self.TEXT,
+                 font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(8, 0))
+        self.snap_label_var = tk.StringVar(value="15:00")
+        snap_label_entry = tk.Entry(tb, textvariable=self.snap_label_var,
+                                     width=7, relief="solid", bd=1,
+                                     font=("Consolas", 10))
+        snap_label_entry.pack(side="left", padx=4)
+
+        tk.Button(tb, text="立即抓取快照", command=self._take_snapshot_now,
+                  bg=self.ACCENT, fg="white", relief="flat", padx=12, pady=5,
+                  font=("Microsoft YaHei UI", 9, "bold"), cursor="hand2").pack(side="left", padx=6)
+
+        tk.Button(tb, text="刷新", command=self._refresh_tracking_table,
+                  bg="#E5EEF9", fg=self.TEXT, relief="flat", padx=10, pady=5,
+                  font=("Microsoft YaHei UI", 9), cursor="hand2").pack(side="left", padx=4)
+
+        # 定时器开关
+        sched_frame = tk.Frame(tb, bg=self.BG)
+        sched_frame.pack(side="left", padx=10)
+        tk.Label(sched_frame, text="自动定时:", bg=self.BG, fg=self.TEXT,
+                 font=("Microsoft YaHei UI", 9)).pack(side="left")
+        self.sched_chk = tk.Checkbutton(sched_frame, variable=self.scheduler_on,
+                                         command=self._toggle_scheduler,
+                                         bg=self.BG, activebackground=self.BG)
+        self.sched_chk.pack(side="left")
+        if not scheduler.is_available():
+            self.sched_chk.configure(state="disabled")
+            tk.Label(sched_frame, text="(需安装 apscheduler)", bg=self.BG,
+                     fg=self.SUBTEXT, font=("Microsoft YaHei UI", 8)).pack(side="left")
+
+        self.track_summary_var = tk.StringVar(value="")
+        tk.Label(tb, textvariable=self.track_summary_var, bg=self.BG, fg=self.SUBTEXT,
+                 font=("Microsoft YaHei UI", 9)).pack(side="right")
+
+        # 跟踪表格（动态列）
+        self._track_table_frame = tk.Frame(parent, bg=self.PANEL)
+        self._track_table_frame.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+
+        # 底部汇总
+        self._track_stat_frame = tk.Frame(parent, bg=self.BG, height=28)
+        self._track_stat_frame.pack(fill="x", padx=8, pady=(0, 8))
+
+        # 初始化空表
+        self._build_empty_tracking_table()
+        self._track_snap_log = None
+
+    def _build_empty_tracking_table(self):
+        for w in self._track_table_frame.winfo_children():
+            w.destroy()
+        cols = ["code", "name", "add_price"]
+        self._track_tree = ttk.Treeview(self._track_table_frame, columns=cols, show="headings")
+        vsb = ttk.Scrollbar(self._track_table_frame, orient="vertical",
+                            command=self._track_tree.yview)
+        hsb = ttk.Scrollbar(self._track_table_frame, orient="horizontal",
+                            command=self._track_tree.xview)
+        self._track_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        for c, t, w in [("code","代码",80), ("name","名称",110), ("add_price","加入价",80)]:
+            self._track_tree.heading(c, text=t)
+            self._track_tree.column(c, width=w, minwidth=50, anchor="center")
+        self._track_tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        self._track_table_frame.rowconfigure(0, weight=1)
+        self._track_table_frame.columnconfigure(0, weight=1)
+
+    def _refresh_tracking_dates(self):
+        dates = db.get_watchlist_dates()
+        self.track_date_cb["values"] = dates
+        if not self.track_date_var.get() and dates:
+            self.track_date_var.set(dates[0])
+        self._refresh_tracking_table()
+
+    def _refresh_tracking_table(self):
+        watch_date = self.track_date_var.get()
+        if not watch_date:
+            return
+
+        table = tracker.get_tracking_table(watch_date)
+        if table.empty:
+            self._build_empty_tracking_table()
+            self.track_summary_var.set(f"{watch_date} 暂无快照数据")
+            return
+
+        labels = db.get_snapshot_labels(watch_date)
+
+        # 重建动态列表格
+        for w in self._track_table_frame.winfo_children():
+            w.destroy()
+
+        base_cols = [("code","代码",80), ("name","名称",110), ("add_price","加入价",80)]
+        snap_cols = [(lbl, f"{lbl} 涨跌%", 90) for lbl in labels]
+        all_cols = base_cols + snap_cols
+
+        col_ids = [c[0] for c in all_cols]
+        self._track_tree = ttk.Treeview(self._track_table_frame, columns=col_ids, show="headings")
+        vsb = ttk.Scrollbar(self._track_table_frame, orient="vertical",   command=self._track_tree.yview)
+        hsb = ttk.Scrollbar(self._track_table_frame, orient="horizontal", command=self._track_tree.xview)
+        self._track_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        for col_id, title, width in all_cols:
+            self._track_tree.heading(col_id, text=title)
+            self._track_tree.column(col_id, width=width, minwidth=50, anchor="center")
+
+        # 颜色标记
+        self._track_tree.tag_configure("up",   foreground=self.UP)
+        self._track_tree.tag_configure("down", foreground=self.DOWN)
+
+        for _, row in table.iterrows():
+            values = [
+                str(row.get("code", "")),
+                str(row.get("name", "")),
+                format_value(row.get("add_price"), 2),
+            ]
+            row_tag = ""
+            last_pct = None
+            for lbl in labels:
+                v = row.get(lbl)
+                if v is None or (isinstance(v, float) and pd.isna(v)):
+                    values.append("-")
+                else:
+                    last_pct = float(v)
+                    values.append(f"{v:+.2f}%")
+            if last_pct is not None:
+                row_tag = "up" if last_pct >= 0 else "down"
+            self._track_tree.insert("", "end", values=values, tags=(row_tag,))
+
+        self._track_tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        self._track_table_frame.rowconfigure(0, weight=1)
+        self._track_table_frame.columnconfigure(0, weight=1)
+
+        # 汇总
+        summary = tracker.get_summary(watch_date)
+        self.track_summary_var.set(
+            f"共{summary['total']}只 | 上涨{summary['up']}只 | "
+            f"平均{('+' if (summary['avg_pct'] or 0) >= 0 else '')}"
+            f"{summary['avg_pct'] or 0:.2f}% [{summary['label']}]"
+        )
+
+    def _take_snapshot_now(self):
+        watch_date = self.track_date_var.get()
+        if not watch_date:
+            messagebox.showinfo("提示", "请先选择跟踪日期。")
+            return
+        label = self.snap_label_var.get().strip() or datetime.now().strftime("%H:%M")
+        self.status_var.set(f"正在抓取快照 [{label}]...")
+
+        def _worker():
+            def cb(msg):
+                self.ui_queue.put(("log_track", msg))
+            try:
+                n = tracker.take_snapshot(watch_date, label, progress_cb=cb)
+                self.ui_queue.put(("snap_done", f"快照 [{label}] 完成，共 {n} 条"))
+            except Exception as e:
+                self.ui_queue.put(("snap_done", f"快照失败: {e}"))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _toggle_scheduler(self):
+        if self.scheduler_on.get():
+            def snap_cb(watch_date, label):
+                def cb(msg):
+                    self.ui_queue.put(("log_track", msg))
+                try:
+                    tracker.take_snapshot(watch_date, label, progress_cb=cb)
+                    self.ui_queue.put(("snap_done", f"定时快照 [{label}] 完成"))
+                except Exception as e:
+                    self.ui_queue.put(("snap_done", f"定时快照失败: {e}"))
+
+            ok = scheduler.start(snap_cb)
+            if ok:
+                self.status_var.set("定时快照已启动")
+            else:
+                self.scheduler_on.set(False)
+                messagebox.showwarning("提示", "APScheduler 启动失败，请检查安装。")
+        else:
+            scheduler.stop()
+            self.status_var.set("定时快照已停止")
+
+    # ── ④ 统计分析 Tab ──────────────────────────────────────────────
+    def _build_stats_tab(self, parent):
+        # 设置栏
+        settings = tk.Frame(parent, bg=self.BG)
+        settings.pack(fill="x", padx=8, pady=(8, 4))
+
+        tk.Label(settings, text="统计天数:", bg=self.BG, fg=self.TEXT,
+                 font=("Microsoft YaHei UI", 9)).pack(side="left")
+        tk.Entry(settings, textvariable=self.stats_days_var, width=5,
+                 relief="solid", bd=1, font=("Consolas", 10)).pack(side="left", padx=4)
+
+        tk.Label(settings, text="成功阈值%:", bg=self.BG, fg=self.TEXT,
+                 font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(8, 0))
+        tk.Entry(settings, textvariable=self.stats_threshold_var, width=5,
+                 relief="solid", bd=1, font=("Consolas", 10)).pack(side="left", padx=4)
+
+        tk.Label(settings, text="基准快照标签:", bg=self.BG, fg=self.TEXT,
+                 font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(8, 0))
+        tk.Entry(settings, textvariable=self.stats_label_var, width=8,
+                 relief="solid", bd=1, font=("Consolas", 10)).pack(side="left", padx=4)
+
+        tk.Button(settings, text="刷新统计", command=self._refresh_stats,
+                  bg=self.ACCENT, fg="white", relief="flat", padx=12, pady=5,
+                  font=("Microsoft YaHei UI", 9, "bold"), cursor="hand2").pack(side="left", padx=8)
+        tk.Button(settings, text="导出报告 Excel", command=self._export_stats_excel,
+                  bg="#DCFCE7", fg="#166534", relief="flat", padx=10, pady=5,
+                  font=("Microsoft YaHei UI", 9), cursor="hand2").pack(side="left")
+
+        # 建议文字区
+        self.stats_suggest_text = tk.Text(parent, height=4, wrap="word",
+                                           bg="#F8FAFC", fg=self.TEXT, relief="flat",
+                                           font=("Microsoft YaHei UI", 9))
+        self.stats_suggest_text.pack(fill="x", padx=8, pady=(0, 4))
+        self.stats_suggest_text.insert("end", "点击「刷新统计」加载分析结果。")
+        self.stats_suggest_text.configure(state="disabled")
+
+        # 图表区
+        chart_frame = tk.Frame(parent, bg=self.BG)
+        chart_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self._stats_chart_frame = chart_frame
+
+        if not _MPL_AVAILABLE:
+            tk.Label(chart_frame,
+                     text="matplotlib 未安装，无法显示图表。\n请运行：pip install matplotlib",
+                     bg=self.BG, fg=self.WARN,
+                     font=("Microsoft YaHei UI", 10)).pack(expand=True)
+        else:
+            self._stats_fig = Figure(figsize=(14, 5), dpi=90)
+            self._stats_canvas = FigureCanvasTkAgg(self._stats_fig, master=chart_frame)
+            self._stats_canvas.get_tk_widget().pack(fill="both", expand=True)
+
+    def _refresh_stats(self):
+        try:
+            days = int(self.stats_days_var.get() or 30)
+            threshold = float(self.stats_threshold_var.get() or 1.0)
+            label = self.stats_label_var.get().strip() or "close"
+        except ValueError:
+            messagebox.showerror("参数错误", "天数和阈值必须为数字。")
+            return
+
+        # 建议文字
+        suggestions = stats.generate_suggestions(days=days, threshold_pct=threshold,
+                                                  prefer_label=label)
+        self.stats_suggest_text.configure(state="normal")
+        self.stats_suggest_text.delete("1.0", "end")
+        self.stats_suggest_text.insert("end", "\n".join(suggestions))
+        self.stats_suggest_text.configure(state="disabled")
+
+        if not _MPL_AVAILABLE:
+            return
+
+        # 图表
+        hist = stats.get_history_stats(days=days, threshold_pct=threshold, prefer_label=label)
+        corr = stats.calc_condition_correlation(days=days, prefer_label=label)
+
+        self._stats_fig.clear()
+
+        ax1 = self._stats_fig.add_subplot(1, 2, 1)
+        ax2 = self._stats_fig.add_subplot(1, 2, 2)
+
+        # 左图：历史胜率趋势
+        if not hist.empty and hist["win_rate"].notna().any():
+            valid = hist.dropna(subset=["win_rate"])
+            ax1.plot(valid["date"], valid["win_rate"], marker="o", color="#3B82F6", linewidth=2)
+            ax1.axhline(50, color="gray", linestyle="--", linewidth=0.8)
+            ax1.set_title(f"历史胜率趋势（阈值 {threshold}%）")
+            ax1.set_xlabel("日期")
+            ax1.set_ylabel("胜率 %")
+            ax1.tick_params(axis="x", rotation=45)
+            ax1.grid(True, alpha=0.3)
+        else:
+            ax1.text(0.5, 0.5, "暂无数据", ha="center", va="center",
+                     transform=ax1.transAxes, fontsize=12, color="gray")
+            ax1.set_title("历史胜率趋势")
+
+        # 右图：条件相关性柱状图
+        if not corr.empty and corr["correlation"].notna().any():
+            valid_corr = corr.dropna(subset=["correlation"]).head(12)
+            colors = ["#16A34A" if c >= 0 else "#DC2626"
+                      for c in valid_corr["correlation"]]
+            ax2.barh(valid_corr["field"], valid_corr["correlation"], color=colors)
+            ax2.axvline(0, color="black", linewidth=0.8)
+            ax2.set_title("筛选条件与次日涨幅相关性")
+            ax2.set_xlabel("Pearson 相关系数")
+            ax2.grid(True, alpha=0.3, axis="x")
+        else:
+            ax2.text(0.5, 0.5, "暂无数据", ha="center", va="center",
+                     transform=ax2.transAxes, fontsize=12, color="gray")
+            ax2.set_title("条件相关性")
+
+        self._stats_fig.tight_layout()
+        self._stats_canvas.draw()
+
+    def _export_stats_excel(self):
+        try:
+            days = int(self.stats_days_var.get() or 30)
+            threshold = float(self.stats_threshold_var.get() or 1.0)
+            label = self.stats_label_var.get().strip() or "close"
+        except ValueError:
+            messagebox.showerror("参数错误", "天数和阈值必须为数字。")
+            return
+
+        hist = stats.get_history_stats(days=days, threshold_pct=threshold, prefer_label=label)
+        corr = stats.calc_condition_correlation(days=days, prefer_label=label)
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(BASE_DIR, f"stats_report_{ts}.xlsx")
+        try:
+            with pd.ExcelWriter(path, engine="openpyxl") as writer:
+                if not hist.empty:
+                    hist.to_excel(writer, sheet_name="历史胜率", index=False)
+                if not corr.empty:
+                    corr.to_excel(writer, sheet_name="条件相关性", index=False)
+            messagebox.showinfo("导出完成", f"统计报告已导出：\n{path}")
+        except Exception as e:
+            messagebox.showerror("导出失败", str(e))
+
+    # ── _poll_queue 扩展（处理跟踪快照消息）─────────────────────────
+    def _poll_queue(self):
+        try:
+            while True:
+                item = self.ui_queue.get_nowait()
+                kind = item[0]
+                if kind == "log":
+                    self._append_log(item[1])
+                elif kind == "status":
+                    self.status_var.set(item[1])
+                elif kind == "done":
+                    self._handle_done(item[1])
+                elif kind == "error":
+                    self._handle_error(item[1])
+                elif kind == "log_track":
+                    self.status_var.set(item[1])
+                elif kind == "snap_done":
+                    self.status_var.set(item[1])
+                    self._refresh_tracking_table()
+        except Exception:
+            pass
+        self.root.after(200, self._poll_queue)
 
     def run(self):
         self.root.mainloop()

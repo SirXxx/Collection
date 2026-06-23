@@ -695,12 +695,15 @@ class SelectorApp:
             if run_id is None or run_id == self._run_id:
                 self.ui_queue.put(msg)
 
-        try:
-            self.ui_queue.put(("status", "正在拉取与筛选数据..."))
-            self._queue_log(f"模式：实时行情，数据来源：{DATA_SOURCE_DISPLAY.get(args.data_source, args.data_source)}")
-            self._queue_log(f"排序字段：{SORT_DISPLAY.get(args.sort_by, args.sort_by)}，{'升序' if args.ascending else '降序'}")
+        def _log(text):
+            _put(("log", text))
 
-            self._queue_log("开始拉取实时行情...")
+        try:
+            _put(("status", "正在拉取与筛选数据..."))
+            _log(f"模式：实时行情，数据来源：{DATA_SOURCE_DISPLAY.get(args.data_source, args.data_source)}")
+            _log(f"排序字段：{SORT_DISPLAY.get(args.sort_by, args.sort_by)}，{'升序' if args.ascending else '降序'}")
+
+            _log("开始拉取实时行情...")
             spot_df = core.fetch_spot_data(
                 retries=args.spot_retries,
                 sleep_sec=args.spot_retry_sleep,
@@ -708,16 +711,16 @@ class SelectorApp:
                 data_source=args.data_source,
             )
             if self._stop_event.is_set():
-                self.ui_queue.put(("stopped", None))
+                _put(("stopped", None))
                 return
             spot_src = spot_df.attrs.get("spot_source", "-")
             if spot_src.startswith("cache_"):
                 cache_date = spot_src.replace("cache_", "")
-                self._queue_log(
+                _log(
                     f"⚠ 所有在线接口均不可用，已加载本地缓存行情（{cache_date}），"
                     "数据可能不是最新，筛选结果仅供参考！"
                 )
-            self._queue_log(
+            _log(
                 f"实时行情完成，共 {len(spot_df)} 条；来源：{spot_src}"
             )
             rows = spot_df.to_dict(orient="records")
@@ -726,9 +729,9 @@ class SelectorApp:
             rows = [x for x in rows if core.pass_filters(x, args)]
             rows.sort(key=lambda x: core.sort_value(x, args.sort_by), reverse=not args.ascending)
             rows = rows[:args.top_n]
-            self._queue_log(f"筛选前 {before_count} 条，筛选后 {len(rows)} 条，取前 {args.top_n} 条")
+            _log(f"筛选前 {before_count} 条，筛选后 {len(rows)} 条，取前 {args.top_n} 条")
             if self._stop_event.is_set():
-                self.ui_queue.put(("stopped", None))
+                _put(("stopped", None))
                 return
 
             # 主动添加股票（跳过筛选）
@@ -745,13 +748,13 @@ class SelectorApp:
                         existing.add(r["code"])
                         added_count += 1
                 not_found = [c for c in add_codes if c not in {r["code"] for r in rows}]
-                self._queue_log(f"主动添加 {added_count} 只股票" +
+                _log(f"主动添加 {added_count} 只股票" +
                                 (f"；未找到：{not_found}" if not_found else ""))
 
             used_date = ""
 
             if getattr(args, "low_rising", False) or getattr(args, "fetch_highs_lows", False):
-                self._queue_log(f"正在补充 {len(rows)} 只股票近5日高低价（并发请求，请稍候）...")
+                _log(f"正在补充 {len(rows)} 只股票近5日高低价（并发请求，请稍候）...")
                 rows = core.enrich_with_recent_lows(rows, days=5, data_source=args.data_source,
                                                     stop_event=self._stop_event)
                 if getattr(args, "low_rising", False):
@@ -762,9 +765,9 @@ class SelectorApp:
                         for r in rows
                     ) if rows else False
                     if api_failed:
-                        self._queue_log("⚠ K线接口不可用，近3天最低价递增过滤已自动跳过（结果为行情筛选结果）")
+                        _log("⚠ K线接口不可用，近3天最低价递增过滤已自动跳过（结果为行情筛选结果）")
                     else:
-                        self._queue_log(f"近3天最低价递增筛选后剩余 {len(rows)}/{before_low} 只")
+                        _log(f"近3天最低价递增筛选后剩余 {len(rows)}/{before_low} 只")
 
             df = pd.DataFrame(rows)
             if df.empty:
@@ -776,13 +779,13 @@ class SelectorApp:
             df = df[existing + others]
 
             csv_path, xlsx_path = export_dataframe(df, export_prefix, False, used_date)
-            self._queue_log(f"CSV 已导出：{csv_path}")
+            _log(f"CSV 已导出：{csv_path}")
             if xlsx_path:
-                self._queue_log(f"Excel 已导出：{xlsx_path}")
+                _log(f"Excel 已导出：{xlsx_path}")
             else:
-                self._queue_log("Excel 导出失败，但 CSV 已成功导出")
+                _log("Excel 导出失败，但 CSV 已成功导出")
 
-            self.ui_queue.put(("done", {
+            _put(("done", {
                 "rows": rows,
                 "df": df,
                 "used_date": used_date,
@@ -793,7 +796,7 @@ class SelectorApp:
             }))
         except Exception as e:
             detail = f"{e}\n\n{traceback.format_exc()}"
-            self.ui_queue.put(("error", detail))
+            _put(("error", detail))
 
     def _handle_done(self, payload):
         self.result_rows = payload["rows"]

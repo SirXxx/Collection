@@ -53,11 +53,40 @@ SORT_OPTIONS = [
     "ma5", "tail_30min_pct",
 ]
 
+SORT_DISPLAY = {
+    "price":           "现价",
+    "pct_chg":         "涨跌幅%",
+    "volume":          "成交量",
+    "volume_ratio":    "量比",
+    "turnover":        "换手率%",
+    "market_cap":      "总市値",
+    "circ_market_cap": "流通市値",
+    "pe":              "市盈率PE",
+    "pb":              "市净率PB",
+    "eps":             "每股收益EPS",
+    "roe":             "净资产收益ROE",
+    "revenue":         "营收",
+    "net_profit":      "净利润",
+    "revenue_yoy":     "营收同比%",
+    "profit_yoy":      "利润同比%",
+    "ma5":             "MA5均线",
+    "tail_30min_pct":  "尾盘30min%",
+}
+SORT_DISPLAY_REV = {v: k for k, v in SORT_DISPLAY.items()}
+SORT_OPTIONS_ZH  = list(SORT_DISPLAY.values())
+
 DATA_SOURCE_OPTIONS = core.DATA_SOURCE_OPTIONS  # ["auto", "eastmoney", "sina"]
+DATA_SOURCE_DISPLAY = {
+    "auto":      "自动(依次尝试)",
+    "eastmoney": "东方财富",
+    "sina":      "新浪财经",
+}
+DATA_SOURCE_DISPLAY_REV = {v: k for k, v in DATA_SOURCE_DISPLAY.items()}
+DATA_SOURCE_OPTIONS_ZH  = list(DATA_SOURCE_DISPLAY.values())
 
 CHOICE_OPTIONS = {
-    "sort_by":     SORT_OPTIONS,
-    "data_source": DATA_SOURCE_OPTIONS,
+    "sort_by":     SORT_OPTIONS_ZH,
+    "data_source": DATA_SOURCE_OPTIONS_ZH,
 }
 
 RESULT_COLUMNS = [
@@ -72,6 +101,11 @@ RESULT_COLUMNS = [
     ("low_3",         "最低_3",      75),
     ("low_4",         "最低_4",      75),
     ("low_5",         "最低_5",      75),
+    ("high_1",        "最高_1",      75),
+    ("high_2",        "最高_2",      75),
+    ("high_3",        "最高_3",      75),
+    ("high_4",        "最高_4",      75),
+    ("high_5",        "最高_5",      75),
     ("ma5",           "MA5",        80),
     ("ma10",          "MA10",       80),
     ("ma20",          "MA20",       80),
@@ -96,11 +130,11 @@ RESULT_COLUMNS = [
 
 FIELD_DEFS = [
     ("top_n",            "输出数量 Top N",               "int",    20),
-    ("sort_by",           "排序字段",                   "choice", "pct_chg"),
+    ("sort_by",           "排序字段",                   "choice", "涨跌幅%"),
     ("ascending",         "升序排序",                   "bool",   False),
     ("add_codes",         "主动添加股票(逗号分隔)",         "str",    ""),
     ("include_bj",        "包含北交所",                 "bool",   False),
-    ("data_source",       "数据来源",                   "choice", "auto"),
+    ("data_source",       "数据来源",                   "choice", "自动(依次尝试)"),
     ("export_name",       "导出文件名前缀(可空)",      "str",    ""),
     ("spot_retries",      "实时行情重试次数",           "int",    3),
     ("spot_retry_sleep",  "实时行情重试间隔秒",           "int",    3),
@@ -121,6 +155,8 @@ FIELD_DEFS = [
     ("max_pb",            "最大 PB",                    "float",  ""),
     ("min_roe",           "最小 ROE%",                  "float",  ""),
     ("low_rising",        "近3天最低价递增",             "bool",   False),
+    ("price_at_high",     "价格触及今日最高(≥99%)",  "bool",   False),
+    ("fetch_highs_lows",  "获取近5日高低价",            "bool",   False),
     ("fetch_indicators",  "获取技术指标(MA、尾盘等)",   "bool",   False),
     ("fetch_roe",         "同时获取 ROE",               "bool",   False),
     ("price_above_ma5",   "价格在 MA5 上方",             "bool",   False),
@@ -149,10 +185,10 @@ SECTION_LAYOUT = [
         ("min_volume_ratio", "max_volume_ratio"),
         ("min_turnover", "max_turnover"),
         ("min_market_cap", "max_market_cap"),
-        "min_pe", "max_pe", "max_pb", "min_roe", "low_rising"
+        "price_at_high", "low_rising",
     ]),
     ("技术指标", [
-        "fetch_indicators", "fetch_roe",
+        "fetch_highs_lows", "fetch_indicators", "fetch_roe",
         "price_above_ma5", "price_above_ma10", "price_above_ma20",
         "ma5_trend_up", "tail_30min_positive",
     ]),
@@ -206,15 +242,16 @@ def export_dataframe(df, prefix, finance_only, used_date):
         prefix = "a_stock_finance_only_gui" if finance_only else "a_stock_selected_ak_gui"
     if used_date:
         prefix = f"{prefix}_{used_date}"
-    csv_path = os.path.join(BASE_DIR, f"{prefix}_{timestamp}.csv")
-    xlsx_path = os.path.join(BASE_DIR, f"{prefix}_{timestamp}.xlsx")
+    csv_path  = os.path.join(BASE_DIR, "output", f"{prefix}_{timestamp}.csv")
+    xlsx_path = os.path.join(BASE_DIR, "output", f"{prefix}_{timestamp}.xlsx")
 
+    os.makedirs(os.path.join(BASE_DIR, "output"), exist_ok=True)
     df.to_csv(csv_path, index=False, encoding="utf-8-sig")
 
     try:
         with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="Results")
-            ws = writer.sheets["Results"]
+            df.to_excel(writer, index=False, sheet_name="筛选结果")
+            ws = writer.sheets["筛选结果"]
             ws.freeze_panes = "A2"
             for col_cells in ws.columns:
                 max_len = 0
@@ -261,6 +298,8 @@ class SelectorApp:
         self.last_xlsx_path = ""
         self.running = False
         self.ui_queue = queue.Queue()
+        self._stop_event = threading.Event()
+        self._run_id = 0  # 每次启动新运行自增，旧线程回调通过比对 run_id 被自动忽略
 
         # 次日跟踪状态
         self.track_date_var = tk.StringVar()
@@ -342,6 +381,12 @@ class SelectorApp:
                                  bg=self.ACCENT, fg="white", relief="flat", padx=16, pady=6,
                                  font=("Microsoft YaHei UI", 10, "bold"), cursor="hand2")
         self.run_btn.pack(side="left")
+
+        self.stop_btn = tk.Button(toolbar, text="■ 停止", command=self.stop_selection,
+                                  bg="#FEE2E2", fg=self.ERROR, relief="flat", padx=12, pady=6,
+                                  font=("Microsoft YaHei UI", 10, "bold"), cursor="hand2",
+                                  state="disabled")
+        self.stop_btn.pack(side="left", padx=6)
 
         tk.Button(toolbar, text="保存参数", command=self.save_current_config,
                   bg="#E5EEF9", fg=self.TEXT, relief="flat", padx=12, pady=6,
@@ -548,9 +593,13 @@ class SelectorApp:
         if top_n is None or top_n <= 0:
             raise ValueError("输出数量 Top N 必须大于 0")
 
+        sort_by_raw = data.get("sort_by") or "涨跌幅%"
+        sort_by = SORT_DISPLAY_REV.get(sort_by_raw, sort_by_raw)
+        data_source_raw = data.get("data_source") or "自动(依次尝试)"
+        data_source = DATA_SOURCE_DISPLAY_REV.get(data_source_raw, data_source_raw)
         args = SimpleNamespace(
             top_n=top_n,
-            sort_by=data.get("sort_by") or "pct_chg",
+            sort_by=sort_by,
             ascending=bool(data.get("ascending")),
             csv="",
             add_codes=data.get("add_codes", ""),
@@ -573,6 +622,8 @@ class SelectorApp:
             spot_retries=parse_int("spot_retries", 3),
             spot_retry_sleep=parse_int("spot_retry_sleep", 3),
             low_rising=bool(data.get("low_rising")),
+            price_at_high=bool(data.get("price_at_high")),
+            fetch_highs_lows=bool(data.get("fetch_highs_lows")),
             fetch_indicators=bool(data.get("fetch_indicators")),
             fetch_roe=bool(data.get("fetch_roe")),
             price_above_ma5=bool(data.get("price_above_ma5")),
@@ -580,7 +631,7 @@ class SelectorApp:
             price_above_ma20=bool(data.get("price_above_ma20")),
             ma5_trend_up=bool(data.get("ma5_trend_up")),
             tail_30min_positive=bool(data.get("tail_30min_positive")),
-            data_source=data.get("data_source", "auto") or "auto",
+            data_source=data_source,
         )
 
         if args.sort_by not in SORT_OPTIONS:
@@ -605,9 +656,17 @@ class SelectorApp:
         self.status_var.set("已恢复默认值")
         self._append_log("表单已恢复默认值（尚未保存）")
 
-    def run_selection(self):
+    def stop_selection(self):
         if self.running:
-            messagebox.showinfo("提示", "当前已有任务在运行，请稍候。")
+            self._stop_event.set()
+            self.stop_btn.configure(state="disabled")
+            self.status_var.set("正在停止...")
+            self._append_log("用户请求停止，等待当前步骤完成...")
+
+    def run_selection(self):
+        # 如果任务运行中且未请求停止，拒绝重复运行
+        if self.running and not self._stop_event.is_set():
+            messagebox.showinfo("提示", "当前已有任务在运行，请先点击『停止』。")
             return
         try:
             args = self._to_args()
@@ -616,21 +675,30 @@ class SelectorApp:
             return
 
         self.save_current_config()
+        self._run_id += 1          # 旧线程所有后续回调将因 run_id 不匹配而被忽略
         self.running = True
+        self._stop_event.clear()
         self.run_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
         self.status_var.set("运行中...")
         self._append_log("=" * 70)
         self._append_log("开始运行筛选...")
 
         export_prefix = self._collect_form_data().get("export_name", "")
-        t = threading.Thread(target=self._worker_run, args=(args, export_prefix), daemon=True)
+        run_id = self._run_id
+        t = threading.Thread(target=self._worker_run, args=(args, export_prefix, run_id), daemon=True)
         t.start()
 
-    def _worker_run(self, args, export_prefix):
+    def _worker_run(self, args, export_prefix, run_id=None):
+        def _put(msg):
+            """only enqueue if this run is still current"""
+            if run_id is None or run_id == self._run_id:
+                self.ui_queue.put(msg)
+
         try:
             self.ui_queue.put(("status", "正在拉取与筛选数据..."))
-            self._queue_log(f"模式：实时行情，数据来源：{args.data_source}")
-            self._queue_log(f"排序字段：{args.sort_by}，{'升序' if args.ascending else '降序'}")
+            self._queue_log(f"模式：实时行情，数据来源：{DATA_SOURCE_DISPLAY.get(args.data_source, args.data_source)}")
+            self._queue_log(f"排序字段：{SORT_DISPLAY.get(args.sort_by, args.sort_by)}，{'升序' if args.ascending else '降序'}")
 
             self._queue_log("开始拉取实时行情...")
             spot_df = core.fetch_spot_data(
@@ -639,8 +707,18 @@ class SelectorApp:
                 include_bj=args.include_bj,
                 data_source=args.data_source,
             )
+            if self._stop_event.is_set():
+                self.ui_queue.put(("stopped", None))
+                return
+            spot_src = spot_df.attrs.get("spot_source", "-")
+            if spot_src.startswith("cache_"):
+                cache_date = spot_src.replace("cache_", "")
+                self._queue_log(
+                    f"⚠ 所有在线接口均不可用，已加载本地缓存行情（{cache_date}），"
+                    "数据可能不是最新，筛选结果仅供参考！"
+                )
             self._queue_log(
-                f"实时行情完成，共 {len(spot_df)} 条；来源：{spot_df.attrs.get('spot_source', '-')}"
+                f"实时行情完成，共 {len(spot_df)} 条；来源：{spot_src}"
             )
             rows = spot_df.to_dict(orient="records")
 
@@ -649,6 +727,9 @@ class SelectorApp:
             rows.sort(key=lambda x: core.sort_value(x, args.sort_by), reverse=not args.ascending)
             rows = rows[:args.top_n]
             self._queue_log(f"筛选前 {before_count} 条，筛选后 {len(rows)} 条，取前 {args.top_n} 条")
+            if self._stop_event.is_set():
+                self.ui_queue.put(("stopped", None))
+                return
 
             # 主动添加股票（跳过筛选）
             add_codes_str = (args.add_codes or "").strip()
@@ -669,19 +750,21 @@ class SelectorApp:
 
             used_date = ""
 
-            if getattr(args, "low_rising", False):
-                self._queue_log(f"正在补充 {len(rows)} 只股票的近5日最低价（并发请求，请稍候）...")
-                rows = core.enrich_with_recent_lows(rows, days=5, data_source=args.data_source)
-                before_low = len(rows)
-                rows = [r for r in rows if core.pass_low_rising_filter(r)]
-                api_failed = all(
-                    not any(r.get(f"low_{i}") is not None for i in range(1, 6))
-                    for r in rows
-                ) if rows else False
-                if api_failed:
-                    self._queue_log("⚠ K线接口不可用，近3天最低价递增过滤已自动跳过（结果为行情筛选结果）")
-                else:
-                    self._queue_log(f"近3天最低价递增筛选后剩余 {len(rows)}/{before_low} 只")
+            if getattr(args, "low_rising", False) or getattr(args, "fetch_highs_lows", False):
+                self._queue_log(f"正在补充 {len(rows)} 只股票近5日高低价（并发请求，请稍候）...")
+                rows = core.enrich_with_recent_lows(rows, days=5, data_source=args.data_source,
+                                                    stop_event=self._stop_event)
+                if getattr(args, "low_rising", False):
+                    before_low = len(rows)
+                    rows = [r for r in rows if core.pass_low_rising_filter(r)]
+                    api_failed = all(
+                        not any(r.get(f"low_{i}") is not None for i in range(1, 6))
+                        for r in rows
+                    ) if rows else False
+                    if api_failed:
+                        self._queue_log("⚠ K线接口不可用，近3天最低价递增过滤已自动跳过（结果为行情筛选结果）")
+                    else:
+                        self._queue_log(f"近3天最低价递增筛选后剩余 {len(rows)}/{before_low} 只")
 
             df = pd.DataFrame(rows)
             if df.empty:
@@ -692,7 +775,7 @@ class SelectorApp:
             others = [c for c in df.columns if c not in existing]
             df = df[existing + others]
 
-            csv_path, xlsx_path = export_dataframe(df, export_prefix, args.finance_only, used_date)
+            csv_path, xlsx_path = export_dataframe(df, export_prefix, False, used_date)
             self._queue_log(f"CSV 已导出：{csv_path}")
             if xlsx_path:
                 self._queue_log(f"Excel 已导出：{xlsx_path}")
@@ -725,6 +808,9 @@ class SelectorApp:
                 date_str = first.get(f"low_date_{idx}", "")
                 label = f"最低_{date_str[5:]}" if date_str else f"最低_{idx}"
                 self.tree.heading(f"low_{idx}", text=label)
+                high_date_str = first.get(f"high_date_{idx}", "")
+                high_label = f"最高_{high_date_str[5:]}" if high_date_str else f"最高_{idx}"
+                self.tree.heading(f"high_{idx}", text=high_label)
 
         self._refresh_tree()
         mode_text = "实时行情"
@@ -733,6 +819,7 @@ class SelectorApp:
         )
         self.status_var.set("运行完成")
         self.run_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
         self.running = False
 
         # 激活"加入自选"按钮
@@ -748,10 +835,18 @@ class SelectorApp:
     def _handle_error(self, detail):
         self.running = False
         self.run_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
         self.status_var.set("运行失败")
         self._append_log("运行失败：")
         self._append_log(detail)
         messagebox.showerror("运行失败", detail[:3000])
+
+    def _handle_stopped(self):
+        self.running = False
+        self.run_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
+        self.status_var.set("已停止")
+        self._append_log("筛选已由用户停止。")
 
     def _refresh_tree(self):
         for item in self.tree.get_children():
@@ -762,7 +857,8 @@ class SelectorApp:
             for col, _title, _width in RESULT_COLUMNS:
                 v = row.get(col)
                 if col in ("price", "pct_chg", "volume_ratio", "turnover", "market_cap", "pe", "pb", "roe",
-                           "low_1", "low_2", "low_3", "low_4", "low_5"):
+                           "low_1", "low_2", "low_3", "low_4", "low_5",
+                           "high_1", "high_2", "high_3", "high_4", "high_5"):
                     values.append(format_value(v, 2))
                 elif col == "volume":
                     values.append(format_value(v, 0))
@@ -1249,7 +1345,8 @@ class SelectorApp:
         corr = stats.calc_condition_correlation(days=days, prefer_label=label)
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(BASE_DIR, f"stats_report_{ts}.xlsx")
+        path = os.path.join(BASE_DIR, "output", f"stats_report_{ts}.xlsx")
+        os.makedirs(os.path.join(BASE_DIR, "output"), exist_ok=True)
         try:
             with pd.ExcelWriter(path, engine="openpyxl") as writer:
                 if not hist.empty:
@@ -1274,6 +1371,8 @@ class SelectorApp:
                     self._handle_done(item[1])
                 elif kind == "error":
                     self._handle_error(item[1])
+                elif kind == "stopped":
+                    self._handle_stopped()
                 elif kind == "log_track":
                     self.status_var.set(item[1])
                 elif kind == "snap_done":

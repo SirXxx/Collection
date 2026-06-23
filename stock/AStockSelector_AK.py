@@ -94,7 +94,11 @@ def recent_report_dates(max_count=8):
 
 
 def normalize_code(code):
-    return str(code).strip().zfill(6)
+    s = str(code).strip()
+    # Strip exchange prefix (sh/sz/bj) if present, e.g. "sh600001" -> "600001"
+    if len(s) > 6 and s[:2].isalpha() and s[2:].isdigit():
+        s = s[2:]
+    return s.zfill(6)
 
 
 def is_a_share_code(code, include_bj=False):
@@ -106,9 +110,50 @@ def is_a_share_code(code, include_bj=False):
     return False
 
 
+# ── 行情缓存工具 ────────────────────────────────────────────────────────────
+SPOT_CACHE_DIR = os.path.join(BASE_DIR, "output", "cache")
+
+
+def _save_spot_cache(df):
+    """将行情数据保存到当天缓存文件。"""
+    try:
+        os.makedirs(SPOT_CACHE_DIR, exist_ok=True)
+        date_str = datetime.now().strftime("%Y%m%d")
+        path = os.path.join(SPOT_CACHE_DIR, f"spot_{date_str}.csv")
+        df.to_csv(path, index=False, encoding="utf-8-sig")
+    except Exception:
+        pass
+
+
+def _load_spot_cache(max_days=3):
+    """尝试加载最近 max_days 天内最新的行情缓存，返回 (df, date_str) 或 None。"""
+    if not os.path.exists(SPOT_CACHE_DIR):
+        return None
+    from datetime import timedelta
+    today = datetime.now()
+    for delta in range(max_days):
+        date_str = (today - timedelta(days=delta)).strftime("%Y%m%d")
+        path = os.path.join(SPOT_CACHE_DIR, f"spot_{date_str}.csv")
+        if os.path.exists(path):
+            try:
+                df = pd.read_csv(path, dtype=str, encoding="utf-8-sig")
+                # 还原数值列
+                for col in ("price", "pct_chg", "volume", "volume_ratio", "turnover",
+                            "market_cap", "circ_market_cap", "pe", "pb",
+                            "today_high", "today_low"):
+                    if col in df.columns:
+                        df[col] = pd.to_numeric(df[col], errors="coerce")
+                df.attrs["spot_source"] = f"cache_{date_str}"
+                return df, date_str
+            except Exception:
+                pass
+    return None
+
+
 def fetch_spot_data(retries=3, sleep_sec=3, include_bj=False, data_source="auto"):
     """使用 akshare 拉取实时行情。
     data_source: 'auto'=自动依次尝试, 'eastmoney'=东方财富优先, 'sina'=新浪财经优先。
+    所有接口失败时自动降级到本地缓存（最近3天内）。
     财报数据始终来自东方财富接口。"""
     _em   = ("stock_zh_a_spot_em", getattr(ak, "stock_zh_a_spot_em", None))
     _sina = ("stock_zh_a_spot",    getattr(ak, "stock_zh_a_spot", None))
@@ -131,35 +176,44 @@ def fetch_spot_data(retries=3, sleep_sec=3, include_bj=False, data_source="auto"
                 df = func()
                 if df is None or df.empty:
                     raise RuntimeError("返回空数据")
-                return standardize_spot_df(df, source=func_name, include_bj=include_bj)
+                result = standardize_spot_df(df, source=func_name, include_bj=include_bj)
+                _save_spot_cache(result)
+                return result
             except Exception as e:
                 last_err = e
                 attempts.append(f"{func_name} 第{i}次失败: {repr(e)}")
                 time.sleep(sleep_sec)
 
-    # 降级方案：直接通过 push2 ulist.np/get 批量查询（仅限东方财富/自动模式）
-    if data_source != "sina":
-        print("所选行情接口均不可用，尝试降级方案: push2 ulist.np/get 批量查询...")
-        for ulist_try in range(1, retries + 1):
-            try:
-                print(f"  ulist.np 尝试 第 {ulist_try}/{retries} 次...")
-                df = _fetch_spot_via_ulist(include_bj=include_bj)
-                if df is not None and not df.empty:
-                    return df
-            except Exception as e:
-                last_err = e
-                attempts.append(f"ulist.np 第{ulist_try}次失败: {repr(e)}")
-                if ulist_try < retries:
-                    time.sleep(sleep_sec)
+    # 降级方案一：直接通过 push2 ulist.np/get 批量查询（所有模式均尝试）
+    print("所选行情接口均不可用，尝试降级方案: push2 ulist.np/get 批量查询...")
+    for ulist_try in range(1, retries + 1):
+        try:
+            print(f"  ulist.np 尝试 第 {ulist_try}/{retries} 次...")
+            df = _fetch_spot_via_ulist(include_bj=include_bj)
+            if df is not None and not df.empty:
+                _save_spot_cache(df)
+                return df
+        except Exception as e:
+            last_err = e
+            attempts.append(f"ulist.np 第{ulist_try}次失败: {repr(e)}")
+            if ulist_try < retries:
+                time.sleep(sleep_sec)
+
+    # 降级方案二：加载本地缓存（最近3天内）
+    cached = _load_spot_cache(max_days=3)
+    if cached is not None:
+        cache_df, cache_date = cached
+        print(f"⚠ 所有在线接口不可用，已加载本地缓存行情（{cache_date}），数据可能不是最新。")
+        return cache_df
 
     msg = "\n".join(attempts[-10:]) if attempts else repr(last_err)
     source_hint = {"eastmoney": "东方财富", "sina": "新浪财经", "auto": "全部来源"}.get(data_source, data_source)
     raise RuntimeError(
-        f"实时行情接口均不可用（数据来源：{source_hint}）。\n"
+        f"实时行情接口均不可用（数据来源：{source_hint}），且无本地缓存可用。\n"
         "可能原因：\n"
         "  1. 当前网络环境无法访问所选数据源\n"
         "  2. 服务器临时故障或接口变更\n"
-        "建议：切换其他数据来源，或使用 --finance-only 模式仅获取财报数据。\n"
+        "建议：切换数据来源，或等待网络恢复后重试。\n"
         f"最近失败记录：\n{msg}"
     ) from last_err
 
@@ -309,8 +363,8 @@ def standardize_spot_df(df, source, include_bj=False):
     return out
 
 
-def fetch_recent_lows(code, days=5, data_source="auto"):
-    """获取股票最近 days 个交易日的最低价。
+def fetch_recent_highs_lows(code, days=5, data_source="auto"):
+    """获取股票最近 days 个交易日的最高价和最低价。
     data_source: 'eastmoney'=东方财富 K线, 'sina'=尝试网易163降级, 'auto'=EM优先+163备用。"""
     from datetime import timedelta
     end_date = datetime.now().strftime("%Y%m%d")
@@ -341,39 +395,60 @@ def fetch_recent_lows(code, days=5, data_source="auto"):
                     col_map[c] = "date"
                 elif cs in ("最低", "最低价"):
                     col_map[c] = "low"
+                elif cs in ("最高", "最高价"):
+                    col_map[c] = "high"
             df = df.rename(columns=col_map)
-            if "date" not in df.columns or "low" not in df.columns:
+            if "date" not in df.columns:
                 continue
-            df = df[["date", "low"]].copy()
+            keep = ["date"] + [c for c in ("low", "high") if c in df.columns]
+            if len(keep) < 2:
+                continue
+            df = df[keep].copy()
             df["date"] = df["date"].astype(str).str[:10]
-            df["low"] = df["low"].map(safe_float)
-            df = df[df["low"].notna()].tail(days)
+            for col in ("low", "high"):
+                if col in df.columns:
+                    df[col] = df[col].map(safe_float)
+            df = df.tail(days)
             return df.to_dict(orient="records")
         except Exception:
             continue
     return []
 
 
-def enrich_with_recent_lows(rows, days=5, max_workers=5, data_source="auto"):
-    """为筛选结果批量补充近 days 个交易日最低价（low_1 最旧，low_N 最新），并发获取。"""
+def fetch_recent_lows(code, days=5, data_source="auto"):
+    """向后兼容包装，调用 fetch_recent_highs_lows。"""
+    return fetch_recent_highs_lows(code, days=days, data_source=data_source)
+
+
+def enrich_with_recent_lows(rows, days=5, max_workers=5, data_source="auto", stop_event=None):
+    """为筛选结果批量补充近 days 个交易日最低价和最高价（low_1/high_1 最旧，low_N/high_N 最新），并发获取。
+    stop_event: threading.Event，设置后提前终止并发拉取。"""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     def _worker(row):
+        if stop_event and stop_event.is_set():
+            return row
         code = row.get("code", "")
-        lows = fetch_recent_lows(code, days=days, data_source=data_source)
-        padded = [None] * (days - len(lows)) + lows
+        records = fetch_recent_highs_lows(code, days=days, data_source=data_source)
+        padded = [None] * (days - len(records)) + records
         for idx, entry in enumerate(padded, start=1):
             if entry:
-                row[f"low_{idx}"] = entry["low"]
-                row[f"low_date_{idx}"] = entry["date"]
+                row[f"low_{idx}"]       = entry.get("low")
+                row[f"low_date_{idx}"]  = entry.get("date", "")
+                row[f"high_{idx}"]      = entry.get("high")
+                row[f"high_date_{idx}"] = entry.get("date", "")
             else:
-                row[f"low_{idx}"] = None
-                row[f"low_date_{idx}"] = ""
+                row[f"low_{idx}"]       = None
+                row[f"low_date_{idx}"]  = ""
+                row[f"high_{idx}"]      = None
+                row[f"high_date_{idx}"] = ""
         return row
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(_worker, row) for row in rows]
         for f in as_completed(futures):
+            if stop_event and stop_event.is_set():
+                break
             try:
                 f.result()
             except Exception:
@@ -440,10 +515,10 @@ def pass_filters(item, args):
         le(item.get("turnover"), args.max_turnover),
         ge(item.get("market_cap"), args.min_market_cap),
         le(item.get("market_cap"), args.max_market_cap),
-        ge(item.get("pe"), args.min_pe),
-        le(item.get("pe"), args.max_pe),
-        le(item.get("pb"), getattr(args, "max_pb", None)),
-        ge(item.get("roe"), getattr(args, "min_roe", None)),
+        # 价格触及今日最高（当前价 ≥ 今日最高×99%）
+        (True if not getattr(args, "price_at_high", False)
+         else (item.get("price") is not None and item.get("today_high") is not None
+               and safe_float(item["price"], 0) >= safe_float(item["today_high"], 0) * 0.99)),
         # 均线过滤（仅在已丰富指标后生效）
         flag_check(item.get("above_ma5"),  getattr(args, "price_above_ma5",  False)),
         flag_check(item.get("above_ma10"), getattr(args, "price_above_ma10", False)),
@@ -629,8 +704,10 @@ def realtime_mode(args):
     print(f"最终选出 {len(rows)} 只股票：")
     print_table(rows)
 
+    out_dir = os.path.join(BASE_DIR, "output")
+    os.makedirs(out_dir, exist_ok=True)
     csv_name = args.csv.strip() if args.csv else f"a_stock_selected_ak_{now_str()}.csv"
-    csv_path = os.path.join(BASE_DIR, csv_name)
+    csv_path = os.path.join(out_dir, csv_name)
     export_csv(rows, csv_path)
     print()
     print(f"结果已导出到: {csv_path}")

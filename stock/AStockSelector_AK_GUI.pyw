@@ -80,6 +80,7 @@ DATA_SOURCE_DISPLAY = {
     "auto":      "自动(依次尝试)",
     "eastmoney": "东方财富",
     "sina":      "新浪财经",
+    "tencent":   "腾讯财经(公司内网)",
 }
 DATA_SOURCE_DISPLAY_REV = {v: k for k, v in DATA_SOURCE_DISPLAY.items()}
 DATA_SOURCE_OPTIONS_ZH  = list(DATA_SOURCE_DISPLAY.values())

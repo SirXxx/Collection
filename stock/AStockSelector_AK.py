@@ -39,14 +39,58 @@ except Exception:
     pass
 
 import pandas as pd
+
+# ── 公司代理 SSL 兼容补丁 ──────────────────────────────────────────────────
+# 公司网络通过透明代理做 HTTPS 拦截，代理根证书未被 Python 的 certifi 信任，
+# 导致所有 HTTPS 请求抛出 SSLCertVerificationError。
+# 在此全局关闭 SSL 验证（仅影响本进程），让代理证书可以被接受。
+import ssl
+import urllib3
+import requests as _requests_mod
+
+ssl._create_default_https_context = ssl._create_unverified_context  # noqa: SLF001
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+_orig_session_request = _requests_mod.Session.request
+
+
+def _no_verify_request(self, method, url, **kwargs):
+    kwargs.setdefault("verify", False)
+    return _orig_session_request(self, method, url, **kwargs)
+
+
+_requests_mod.Session.request = _no_verify_request
+
+# ── Windows SSPI 代理认证（腾讯财经接口专用）─────────────────────────────────
+# 公司代理需要 Windows 集成认证（NTLM/Kerberos）。
+# requests_negotiate_sspi 包利用当前登录的 Windows 凭证自动完成握手，
+# 无需手动输入密码。
+_SSPI_SESSION = None
+
+
+def _get_sspi_session():
+    global _SSPI_SESSION
+    if _SSPI_SESSION is not None:
+        return _SSPI_SESSION
+    try:
+        from requests_negotiate_sspi import HttpNegotiateAuth  # noqa: PLC0415
+        sess = _requests_mod.Session()
+        sess.auth = HttpNegotiateAuth()
+        _SSPI_SESSION = sess
+        return sess
+    except ImportError:
+        return None
+# ─────────────────────────────────────────────────────────────────────────────
+
 import akshare as ak
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-DATA_SOURCE_OPTIONS = ["auto", "eastmoney", "sina"]
+DATA_SOURCE_OPTIONS = ["auto", "eastmoney", "sina", "tencent"]
 # auto      — 自动，依次尝试全部来源
 # eastmoney — 东方财富（stock_zh_a_spot_em + push2 ulist 降级）
 # sina      — 新浪财经（stock_zh_a_spot），历史K线备选网易163
+# tencent   — 腾讯财经（qt.gtimg.cn HTTP + Windows SSPI），适合公司内网环境
 A_CODE_PREFIX = (
     "000", "001", "002", "003",
     "300", "301",
@@ -157,7 +201,20 @@ def fetch_spot_data(retries=3, sleep_sec=3, include_bj=False, data_source="auto"
     财报数据始终来自东方财富接口。"""
     _em   = ("stock_zh_a_spot_em", getattr(ak, "stock_zh_a_spot_em", None))
     _sina = ("stock_zh_a_spot",    getattr(ak, "stock_zh_a_spot", None))
-    if data_source == "eastmoney":
+    if data_source == "tencent":
+        # 直接使用腾讯财经接口（Windows SSPI），跳过其他接口
+        print("数据来源: 腾讯财经（qt.gtimg.cn HTTP + Windows SSPI）")
+        try:
+            df = _fetch_spot_via_tencent(include_bj=include_bj)
+            if df is not None and not df.empty:
+                _save_spot_cache(df)
+                return df
+        except Exception as e:
+            raise RuntimeError(
+                f"腾讯财经接口失败: {e}\n"
+                "请确认已安装 requests-negotiate-sspi 包（pip install requests-negotiate-sspi）"
+            ) from e
+    elif data_source == "eastmoney":
         funcs = [_em]
     elif data_source == "sina":
         funcs = [_sina, _em]
@@ -185,7 +242,7 @@ def fetch_spot_data(retries=3, sleep_sec=3, include_bj=False, data_source="auto"
                 time.sleep(sleep_sec)
 
     # 降级方案一：直接通过 push2 ulist.np/get 批量查询（所有模式均尝试）
-    print("所选行情接口均不可用，尝试降级方案: push2 ulist.np/get 批量查询...")
+    print("所选行情接口均不可用，尝试降级方案一: push2 ulist.np/get 批量查询...")
     for ulist_try in range(1, retries + 1):
         try:
             print(f"  ulist.np 尝试 第 {ulist_try}/{retries} 次...")
@@ -199,7 +256,18 @@ def fetch_spot_data(retries=3, sleep_sec=3, include_bj=False, data_source="auto"
             if ulist_try < retries:
                 time.sleep(sleep_sec)
 
-    # 降级方案二：加载本地缓存（最近3天内）
+    # 降级方案二：腾讯财经 HTTP 接口（使用 Windows SSPI 认证，适合公司代理环境）
+    print("尝试降级方案二: 腾讯财经 qt.gtimg.cn（Windows SSPI 认证）...")
+    try:
+        df = _fetch_spot_via_tencent(include_bj=include_bj)
+        if df is not None and not df.empty:
+            _save_spot_cache(df)
+            return df
+    except Exception as e:
+        last_err = e
+        attempts.append(f"腾讯财经失败: {repr(e)}")
+
+    # 降级方案三：加载本地缓存（最近3天内）
     cached = _load_spot_cache(max_days=3)
     if cached is not None:
         cache_df, cache_date = cached
@@ -307,7 +375,96 @@ def _fetch_spot_via_ulist(include_bj=False, batch_size=500):
     return df
 
 
-def standardize_spot_df(df, source, include_bj=False):
+def _fetch_spot_via_tencent(include_bj=False, batch_size=100):
+    """通过腾讯财经 qt.gtimg.cn HTTP 接口批量拉取 A 股实时行情。
+    使用 Windows SSPI 认证（requests_negotiate_sspi）绕过公司代理认证。
+    字段映射（88字段格式）：
+      [1]=名称, [2]=代码, [3]=现价, [4]=昨收, [6]=成交量(手),
+      [31]=涨跌额, [39]=PE, [44]=总市值(亿), [45]=流通市值(亿), [46]=PB,
+      [47]=涨停价, [48]=跌停价
+    涨跌幅由 (现价-昨收)/昨收*100 计算。
+    今日最高取自 f[35].split('/')[0]，今日最低在交易前为0（忽略）。
+    """
+    session = _get_sspi_session()
+    if session is None:
+        raise RuntimeError(
+            "腾讯财经接口需要 requests_negotiate_sspi 包提供 Windows SSPI 认证。\n"
+            "请运行：pip install requests-negotiate-sspi"
+        )
+
+    # 生成全部 A 股代码（腾讯格式：sh/sz + 6位数字）
+    codes = []
+    for prefix in ["600", "601", "603", "605", "688", "689"]:
+        for i in range(1000):
+            codes.append(f"sh{prefix}{i:03d}")
+    for prefix in ["000", "001", "002", "003", "300", "301"]:
+        for i in range(1000):
+            codes.append(f"sz{prefix}{i:03d}")
+    if include_bj:
+        for prefix in ["430", "830", "831", "832", "833", "834", "835",
+                        "836", "837", "838", "839", "870", "871", "872",
+                        "873", "874", "875", "876", "877", "878", "879"]:
+            for i in range(1000):
+                codes.append(f"bj{prefix}{i:03d}")
+
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    records = []
+    total_batches = math.ceil(len(codes) / batch_size)
+
+    for batch_idx in range(total_batches):
+        batch = codes[batch_idx * batch_size: (batch_idx + 1) * batch_size]
+        url = "http://qt.gtimg.cn/q=" + ",".join(batch)
+        try:
+            r = session.get(url, timeout=10, headers=headers, verify=False)
+            if r.status_code != 200:
+                raise RuntimeError(f"HTTP {r.status_code}")
+            r.encoding = "gbk"
+            for seg in r.text.strip().split(";"):
+                seg = seg.strip()
+                if not seg or "=" not in seg or not seg.startswith("v_"):
+                    continue
+                val = seg.split("=", 1)[1].strip('"')
+                f = val.split("~")
+                if len(f) < 45:
+                    continue
+                price = safe_float(f[3])
+                if not price or price <= 0:
+                    continue  # 未上市/停牌
+                close_prev = safe_float(f[4])
+                pct_chg = round((price - close_prev) / close_prev * 100, 2) if close_prev else None
+                # 今日最高：f[35] 格式为 "high/vol/?" 或 "0.00"
+                raw_high = f[35] if len(f) > 35 else ""
+                today_high = safe_float(raw_high.split("/")[0]) if "/" in raw_high else safe_float(raw_high)
+                if today_high == 0:
+                    today_high = None
+                records.append({
+                    "code":           normalize_code(f[2]),
+                    "name":           f[1],
+                    "price":          price,
+                    "pct_chg":        pct_chg,
+                    "volume":         safe_float(f[6]),           # 手
+                    "today_high":     today_high,
+                    "pe":             safe_float(f[39]),           # 市盈率
+                    "market_cap":     safe_float(f[44]),           # 总市值(亿元)
+                    "circ_market_cap":safe_float(f[45]),           # 流通市值(亿元)
+                    "pb":             safe_float(f[46]),           # 市净率
+                })
+        except Exception:
+            continue
+        time.sleep(random.uniform(0.05, 0.15))
+
+    if not records:
+        raise RuntimeError("腾讯财经 API 未获取到任何有效行情数据（可能被代理拦截）")
+
+    print(f"腾讯财经成功获取 {len(records)} 只股票行情")
+    df = pd.DataFrame(records)
+    # 过滤 A 股代码（已 normalize）
+    df = df[df["code"].apply(lambda c: is_a_share_code(c, include_bj=include_bj))]
+    df.attrs["spot_source"] = "tencent_qq"
+    return df
+
+
+
     cols = {str(x).strip(): x for x in df.columns}
 
     def pick(*names):
